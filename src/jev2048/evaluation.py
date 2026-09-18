@@ -14,10 +14,13 @@ from .serialization import OUTCOMES
 @torch.no_grad()
 def predict(model, tokenizer, rows, microbatch=2, max_length=512):
     model.eval()
+    device = next(model.parameters()).device
     predictions = []
     for i in range(0, len(rows), microbatch):
         batch = collate(rows[i : i + microbatch], tokenizer, max_length)
-        with torch.autocast("cuda", dtype=torch.bfloat16):
+        with torch.autocast(
+            device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"
+        ):
             lp = model(batch)
         predictions.extend(lp.exp().cpu().tolist())
     return np.array(predictions)

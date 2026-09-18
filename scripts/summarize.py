@@ -10,6 +10,8 @@ from jev2048.utils import save_json
 FIELDS = [
     "objective",
     "seed",
+    "generation",
+    "target_policy_id",
     "top1_accuracy",
     "observed_nll",
     "observed_brier",
@@ -52,7 +54,11 @@ if __name__ == "__main__":
     p.add_argument(
         "--runs",
         nargs="+",
-        default=["runs/ce_seed17", "runs/brier_seed17", "runs/paired_pg_seed17"],
+        default=[
+            "runs/online_ce_seed17",
+            "runs/online_brier_seed17",
+            "runs/online_paired_pg_seed17",
+        ],
     )
     p.add_argument("--output", default="results/comparison")
     a = p.parse_args()
@@ -60,6 +66,28 @@ if __name__ == "__main__":
     demos = []
     for run in a.runs:
         root = Path(run)
+        if (root / "generations.json").exists():
+            c = json.loads((root / "resolved_config.json").read_text())["config"]
+            for generation in json.loads((root / "generations.json").read_text()):
+                r = {
+                    key: generation[key]
+                    for key in ("objective", "seed", "generation", "target_policy_id")
+                }
+                r.update(generation["probability"])
+                r.update(generation["training_stats"])
+                rows.append({key: r.get(key) for key in FIELDS})
+                for role in ("incumbent", "candidate"):
+                    demos.append(
+                        dict(
+                            objective=c["objective"],
+                            generation=generation["generation"],
+                            role=role,
+                            utility=c["utility"],
+                            accepted=generation["accepted"],
+                        )
+                        | generation[f"{role}_test"]
+                    )
+            continue
         if not (root / "metrics.json").exists():
             continue
         c = json.loads((root / "resolved_config.json").read_text())["config"]
@@ -76,6 +104,9 @@ if __name__ == "__main__":
         demos,
         [
             "objective",
+            "generation",
+            "role",
+            "accepted",
             "utility",
             "games",
             "seed",

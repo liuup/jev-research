@@ -1,0 +1,17 @@
+inherit: online.yaml
+objective: paired_pg
+generations: 2
+steps_per_generation: 2
+effective_batch: 2
+microbatch: 1
+warmup_steps: 1
+eval_every: 1
+source_envs: 1
+select_every: 32
+inference_questions: 4
+validation_questions: 4
+mc_states: 1
+mc_rollouts: 2
+promotion_games: 2
+test_games: 2
+game_batch: 2

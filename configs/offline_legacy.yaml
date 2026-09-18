@@ -1,0 +1,17 @@
+# Reproduce the old experiment only; not used by the online workflow.
+mode: offline
+objective: paired_pg
+seed: 17
+steps: 500
+effective_batch: 16
+microbatch: 8
+backbone_lr: 0.00002
+head_lr: 0.0002
+weight_decay: 0.01
+warmup_steps: 25
+eval_every: 50
+eval_questions: 512
+reward_samples: 32
+baseline: conditional
+data_dir: data/main
+common_init: runs/common_init.pt

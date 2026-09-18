@@ -1,77 +1,65 @@
-# Jev-style 2048
+# Online Jev / RLCD-inspired 2048
 
-用 Qwen3.5-0.8B 学习 `p(y | s,a,pi0)`：在棋盘 `s` 执行动作 `a`，随后使用冻结启发式策略 `pi0`，预测终局最大方块的概率分布。
+通过环境终局反馈，交替进行**结果分布学习和闭环策略改进**。默认使用本地 `/root/shang/hf-modles/Qwen3.5-0.8B-Base`，全参数训练文本骨干与候选集合评分头，不使用视觉塔、LM 输出头或自回归生成。
 
-候选结果为 `<256 / 256 / 512 / 1024 / 2048 / 4096 / 8192+`。架构为共享文本骨干＋候选集合注意力＋评分头，全参数微调，不使用视觉塔、LM 输出头或自回归生成。基础模型：`/root/shang/hf-modles/Qwen3.5-0.8B-Base`。
+## 在线流程
 
-## 实验约定
+1. 初始控制器为启发式策略。每代冻结当前控制器 `πt`。
+2. 用 `πt + 15% 随机动作` 在线探索棋盘，对选中状态的每个合法动作独立分支；后续严格由 `πt` 玩到终局，取得一次观测 `Y`。
+3. 更新 `p(y | s,a,πt)`；默认 paired-PG，32 个预测标签抽样，保留 detached 条件基线。也支持 CE/Brier。
+4. 冻结新模型，构造贪心候选控制器。用独立同种子对局比较候选与当前策略，均分提高超过 2% 才晋升；否则保留当前策略，学习器继续训练。
+5. 下一代重新采集反馈。权重延续、优化器重置，不跨代 replay，不混用不同策略的标签。
 
-- 训练只使用模拟器生成的单次观测结果 `Y`；MC 概率仅用于评估。按来源轨迹划分数据，生成后不得调整冻结策略。
-- 比较 CE、直接 Brier 和 paired-PG。PG 从结果分布抽样 32 次，使用 detached 条件基线，期望奖励为 `2 pᵀq - ||p||²`。实现见 [objectives.py](src/jev2048/objectives.py)；它是 RLCD-inspired 方法，不是官方 TypeSafe RLCD 算法。
-- 三种目标共享初始化、数据及优化设置。默认 500 步、microbatch 8、梯度累积 2、有效 batch 16，使用 BF16、梯度检查点和 AdamW。Slurm 短测中 microbatch 8/16 分别约 1.71/2.09 秒每步，因此采用 8。配置见 `configs/`，支持 `--set key=value`。
-- 动作概率不等于结果概率，准确率不等于校准。闭环控制器表现单独报告。直接 Brier 可能因方差更低而优于 PG；单 seed 和有限 MC 样本不足以证明优越性。
+无需预生成训练集。单卡采用同步“批量采样→更新”；环境在 CPU 执行，神经策略推理和训练都在 Slurm GPU 上执行。所有候选路径、并行环境的合法动作均批量评分。
 
-## 安装与验证
-
-使用 uv 管理环境；所有 GPU 工作通过 Slurm 提交，默认分区、单 GPU、48 小时限制。
+## 验证与启动
 
 ```bash
 uv sync --locked
 uv run pytest -q
 uvx ruff check src scripts tests
-uv run python scripts/benchmark_heuristic.py --games 100
-uv run python scripts/generate_data.py --output data/smoke --train-questions 32 --heldout-questions 8 --workers 4
+uv run python scripts/validate_online.py
+```
+
+以下是之后的 GPU 验证/训练命令；本次代码修改未提交任务。先完成两阶段 smoke 并检查成功，再启动主实验：
+
+```bash
 mkdir -p logs/slurm
 sbatch slurm/smoke_gpu.sbatch
-```
+# 上一作业通过后：
+sbatch slurm/online_smoke.sbatch
+# 在线 smoke 完成后：
+uv run python scripts/verify_training_smoke.py --run runs/online_smoke
 
-CPU 测试包含精确 PG 梯度验证；GPU smoke 检查骨干和决策头的反向传播。验证失败时不要继续训练。
-
-## 数据与训练
-
-以下用于全新实验；已有数据、初始化和运行目录不会被覆盖。等待前一阶段完成后再继续。
-
-```bash
-# GPU smoke 通过后生成正式数据及评估专用 MC 参考集
-uv run python scripts/generate_data.py --output data/main
-uv run python scripts/build_mc_reference.py --pairs 256 --rollouts 256
-uv run python scripts/audit_data.py
-
-# 创建公共初始化，完成后先测试 paired-PG
-sbatch --job-name=jev-init-seed17 slurm/train.sbatch paired_pg --initialize
-sbatch --job-name=jev-pg-smoke-seed17 slurm/train.sbatch paired_pg \
-  --output runs/paired_pg_smoke --set data_dir=data/smoke \
-  --set steps=10 --set microbatch=1 --set eval_every=5 \
-  --set eval_questions=8 --set warmup_steps=2
-
-# smoke 完成后检查，再启动主实验
-uv run python scripts/verify_training_smoke.py
-sbatch --job-name=jev-paired_pg-seed17 slurm/train.sbatch paired_pg
-
-# 完整三目标对照：用此命令替代上面的单目标提交
+# 主实验（仅在准备好后手动提交）
+sbatch --job-name=jev-online-pg-seed17 slurm/train.sbatch paired_pg
+# 或三目标独立在线实验：
 bash slurm/submit_all.sh
+bash slurm/status.sh
+# bash slurm/cancel.sh JOB_ID [JOB_ID ...]
 ```
 
-正式数据为 50,001 / 512 / 514 / 513 个 train/dev/calibration/test 问题。冻结策略的 100 局均分为 15,543.88，达到 512/1024/2048 的比例为 96%/72%/18%。训练集中没有 8192+，4096 也很少，稀有事件结论需谨慎。
+配置位于 `configs/online.yaml`，默认 3 代、每代 100 步、microbatch 8、有效 batch 16、BF16、梯度检查点、AdamW。支持 `--set generations=2 --set steps_per_generation=20`。不依赖旧 `common_init.pt`；从本地 base 和 seed 初始化，也可指定 `initial_checkpoint`。三个目标初始权重与随机种子相同，但在线策略分化后采样轨迹会不同，比较时也需看环境交互量和耗时。
 
-## 日志、评估与演示
+## 结果与评估
+
+`runs/online_paired_pg_seed17/`：
+
+- `training.jsonl`：reward、优势统计、NLL/Brier、熵、预测分布、采样/更新耗时、环境交互量及策略版本；不记录显存。
+- `generation_XXX/events.jsonl`：本代实际用于更新的单次环境反馈，作为审计记录，不是预生成训练集。
+- `generation_XXX/checkpoint.pt`：学习器权重；其预测目标由 `target_policy.json` 指定。显存统计另存 `training_stats.json`。
+- `generation_XXX/metrics.json`：固定 holdout 棋盘上的概率指标、MC 动作排序一致率和效用 regret。每代按对应冻结策略重采标签与 MC 概率。
+- `promotion.json`：晋升用对局；`controller_test.json`：独立测试对局，不参与晋升决定。
+- `active_policy.json`：真正获准接管的策略，可能仍是启发式；不能把最后一个 checkpoint 自动当成更好的控制器。
 
 ```bash
-bash slurm/status.sh
-tail -f logs/slurm/jev-paired_pg-mb8-seed17-JOB_ID.out  # 替换为提交返回的 ID
-# bash slurm/cancel.sh JOB_ID [JOB_ID ...]      # 显式指定要取消的作业
-
-# 训练结束后；训练脚本也会自动执行最终概率评估
-sbatch slurm/evaluate.sbatch --run runs/paired_pg_seed17
-sbatch slurm/play.sbatch --run runs/paired_pg_seed17 --games 10 --utility threshold --threshold 2048
-sbatch slurm/play.sbatch --run runs/paired_pg_seed17 --games 10 --utility log_tile
+sbatch slurm/evaluate.sbatch --run runs/online_paired_pg_seed17/generation_000
+sbatch slurm/play.sbatch --run runs/online_paired_pg_seed17 --policy active --games 100 --seed 0
 uv run python scripts/summarize.py
 ```
 
-- `runs/<objective>_seed17/`：配置、逐步日志、checkpoint、预测和指标。
-- `results/comparison.{csv,json,md}`：NLL、Brier、准确率、MC L2/MAE、ECE、显存和耗时；闭环表单独保存。
-- `results/plots/`：可靠性图；ECE 使用 10 个固定等宽区间。
+汇总输出为 `results/comparison.{csv,json,md}`，概率指标与闭环得分分表保存。训练、holdout、MC、晋升和测试使用隔离随机流；holdout 棋盘固定，MC 标签只用于评估。
 
-`training.jsonl` 记录 PG surrogate loss、采样 paired reward、给定观测标签的期望 reward、命中/碰撞率、优势项统计，以及 NLL/Brier、熵、标签概率、预测桶分布、梯度范数和吞吐。`expected_reward_given_y = 1 - observed_brier`；它不是已知真实分布 q 的评估。详细 dev 可靠性数据另存于 `dev/`，显存只记录在独立的 `training_stats.json`。
+结果概率不等于动作策略概率，预测更准不保证控制更强。这是分代近似策略迭代，不是直接对游戏动作做 REINFORCE，也不是官方 TypeSafe RLCD 算法。小样本晋升可能误判；单 seed 不能证明优越性。GPU 不保证逐位确定性，暂不支持自动断点续训。
 
-运行记录保存种子和数据/初始化哈希。GPU 运算不保证逐位确定性，当前不支持自动断点续训。闭环策略改变后，不能沿用冻结 `pi0` 下的校准解释。
+旧离线工具仅用于复现，入口配置为 `configs/offline_legacy.yaml`；新流程不读取旧数据。旧实验产物已移出项目，恢复目录：`/root/shang/jev-research-legacy-results.l7TDJr`。

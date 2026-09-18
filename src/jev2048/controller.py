@@ -1,32 +1,56 @@
-"""Closed-loop demonstrations are NOT calibrated policy evaluation under pi0."""
+"""Greedy controllers built from outcome models; utilities are not action probabilities."""
 
 import numpy as np
 
 from .evaluation import predict
 
 
+def outcome_utility(p, utility="threshold", threshold=2048):
+    if utility == "threshold":
+        if threshold not in (256, 512, 1024, 2048, 4096, 8192):
+            raise ValueError(threshold)
+        return p[:, np.array([128, 256, 512, 1024, 2048, 4096, 8192]) >= threshold].sum(
+            -1
+        )
+    if utility == "log_tile":
+        return p @ np.array([7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0])
+    raise ValueError(utility)
+
+
 class JevController:
     def __init__(
-        self, model, tokenizer, utility="threshold", threshold=2048, max_length=512
+        self,
+        model,
+        tokenizer,
+        utility="threshold",
+        threshold=2048,
+        max_length=512,
+        inference_questions=16,
     ):
         self.model, self.tokenizer = model, tokenizer
         self.utility, self.threshold, self.max_length = utility, threshold, max_length
+        self.inference_questions = inference_questions
 
     def choose(self, game):
-        actions = game.legal_actions
+        return self.choose_many([game])[0]
+
+    def choose_many(self, games):
+        if not games:
+            return []
+        legal = [game.legal_actions for game in games]
+        if any(not actions for actions in legal):
+            raise ValueError("Cannot act in a terminal game")
         rows = [
-            dict(**game.state(), action=a, state_id=f"demo:{game.steps}")
+            dict(**game.state(), action=a, state_id=f"actor:{i}:{game.steps}")
+            for i, (game, actions) in enumerate(zip(games, legal))
             for a in actions
         ]
-        # All legal action questions and all outcome candidates share one backbone batch.
-        p = predict(self.model, self.tokenizer, rows, len(rows), self.max_length)
-        if self.utility == "threshold":
-            if self.threshold not in (256, 512, 1024, 2048, 4096, 8192):
-                raise ValueError(self.threshold)
-            values = np.array([128, 256, 512, 1024, 2048, 4096, 8192])
-            utility = p[:, values >= self.threshold].sum(-1)
-        elif self.utility == "log_tile":
-            utility = p @ np.array([7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0])
-        else:
-            raise ValueError(self.utility)
-        return actions[int(utility.argmax())]
+        p = predict(
+            self.model, self.tokenizer, rows, self.inference_questions, self.max_length
+        )
+        values = outcome_utility(p, self.utility, self.threshold)
+        result, offset = [], 0
+        for actions in legal:
+            result.append(actions[int(values[offset : offset + len(actions)].argmax())])
+            offset += len(actions)
+        return result

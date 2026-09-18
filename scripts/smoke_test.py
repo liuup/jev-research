@@ -4,7 +4,8 @@ import os
 import torch
 import yaml
 
-from jev2048.dataset import collate, read_rows
+from jev2048.dataset import collate
+from jev2048.env import Game
 from jev2048.model import JevModel, load_tokenizer
 from jev2048.objectives import loss
 from jev2048.utils import save_json, seed_all
@@ -21,7 +22,14 @@ if __name__ == "__main__":
     assert not any("visual" in n or "lm_head" in n for n in names)
     assert all(p.requires_grad for p in model.backbone.parameters())
     tok = load_tokenizer(config["base_model"])
-    batch = collate(read_rows("data/smoke/train.jsonl")[:1], tok, config["max_length"])
+    game = Game(config["seed"])
+    row = dict(
+        **game.state(),
+        action=game.legal_actions[0],
+        state_id="gpu_smoke",
+        observed_outcome="1024",
+    )
+    batch = collate([row], tok, config["max_length"])
     with torch.autocast("cuda", dtype=torch.bfloat16):
         lp = model(batch)
     torch.testing.assert_close(lp.exp().sum(-1), torch.ones(1, device="cuda"))

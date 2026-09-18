@@ -2,7 +2,7 @@ objective: ce
 seed: 17
 steps: 500
 effective_batch: 16
-microbatch: 2
+microbatch: 4
 backbone_lr: 0.00002
 head_lr: 0.0002
 weight_decay: 0.01

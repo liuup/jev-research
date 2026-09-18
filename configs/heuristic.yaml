@@ -1,0 +1,8 @@
+# Frozen before any outcome data are generated. Features use log2 tiles.
+empty: 3.0
+monotonicity: 1.0
+smoothness: 0.15
+merges: 1.0
+corner: 2.0
+maximum: 0.5
+immediate: 0.01

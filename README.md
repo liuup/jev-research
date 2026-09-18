@@ -13,6 +13,7 @@ The local checkpoint is `/root/shang/hf-modles/Qwen3.5-0.8B-Base`. Its safetenso
 ```bash
 uv sync --locked
 uv run pytest -q
+uvx ruff check src scripts tests
 uv run python scripts/benchmark_heuristic.py --games 100 --workers 12
 uv run python scripts/generate_data.py --output data/smoke --train-questions 32 --heldout-questions 8 --workers 4
 mkdir -p logs/slurm
@@ -37,6 +38,8 @@ uv run python scripts/build_mc_reference.py --data-dir data/main --pairs 256 --r
 ```
 
 Generation settings are in `configs/data.yaml`; use `--train-questions`, `--heldout-questions`, and `--workers` to change the first dataset size. The manifest records resolved settings, source seeds, file hashes, and frozen policy hashes. CPU generation uses a process pool; its cost can be substantial because every label requires a terminal rollout.
+
+`uv run python scripts/audit_data.py` checks trajectory isolation, complete legal-action branching, independent rollout seeds, and observed-only labels. The first dataset contains 50,001/512/514/513 train/dev/calibration/test questions from 872/9/10/10 source games. It has no training observations of 8192+, only 73 of 4096, and no test observations of either: calibration conclusions for these rare events are therefore especially limited.
 
 MC reference pairs are sampled from the held-out test questions. Each has 256 independently seeded continuations and a stored count vector, probability estimate, and seed. `mc_reference.jsonl` and its manifest are separate evaluation-only artifacts; training explicitly rejects rows with `q`. MC estimates have sampling error and are not exact known probabilities; evaluation reports an estimated squared-L2 sampling floor. The calibration split is reserved and evaluated separately; no post-hoc calibration is fitted in this first experiment.
 
@@ -80,6 +83,8 @@ sbatch --job-name=jev-paired-pg-seed17 slurm/train.sbatch paired_pg
 The default comparison is 500 optimizer steps, dev evaluation every 50 steps, and the same seeded shuffled logical batch schedule for every objective. Predictive sampling does not change the batch order. Python/NumPy/PyTorch and simulator seeds are fixed. GPU kernels are not forced into fully deterministic mode; floating-point parallel reductions and backend kernels can introduce small differences. Transformers' portable PyTorch linear-attention path is used when optional fused libraries are absent.
 
 Runs store the resolved config, git commit, manifest and initialization hashes, batch schedule hash, step logs, dev scores, final checkpoint with optimizer/scheduler and RNG states, held-out predictions, reliability data, elapsed training time, and allocated/reserved peak GPU memory. Training time includes periodic dev evaluation but excludes final checkpoint writing and final test evaluation. Checkpoint state is saved for reproducibility; automatic resumption is not currently implemented. Generated data, logs, plots and checkpoints are excluded from Git; `uv.lock` is committed.
+
+The initial paired-PG smoke completed 10 steps on 34 training questions, with 8 test questions and an 8-pair × 32-rollout MC smoke cohort. It updated 320 backbone tensors and all 14 head tensors, taking 95.04 seconds with 13.14 GiB peak allocated memory. NLL=1.1256, Brier=.5632, accuracy=.625 and MC squared L2=.13035 are implementation checks on this tiny cohort, not calibration or superiority claims. `results/paired_pg_smoke.{json,csv,md}` contains the complete probability table. Its separate one-game closed-loop smoke reached tile 128 and score 1196; this is only a controller integration check.
 
 ## Probability evaluation and controller demonstration
 

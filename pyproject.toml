@@ -21,3 +21,6 @@ torch = { index = "pytorch" }
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.ruff.lint]
+select = ["E402", "PLC0415"]

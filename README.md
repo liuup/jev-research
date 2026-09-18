@@ -1,3 +1,5 @@
+中文 | [English](README_en.md)
+
 # 2048 game with online Jev (RLCD)
 
 复现Jev, 通过环境反馈, 在2048游戏中使用RLCD进行进化.

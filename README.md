@@ -72,4 +72,6 @@ uv run python scripts/summarize.py
 - `results/comparison.{csv,json,md}`：NLL、Brier、准确率、MC L2/MAE、ECE、显存和耗时；闭环表单独保存。
 - `results/plots/`：可靠性图；ECE 使用 10 个固定等宽区间。
 
+`training.jsonl` 记录 PG surrogate loss、采样 paired reward、给定观测标签的期望 reward、命中/碰撞率、优势项统计，以及 NLL/Brier、熵、标签概率、预测桶分布、梯度范数和吞吐。`expected_reward_given_y = 1 - observed_brier`；它不是已知真实分布 q 的评估。详细 dev 可靠性数据另存于 `dev/`，显存只记录在独立的 `training_stats.json`。
+
 运行记录保存种子和数据/初始化哈希。GPU 运算不保证逐位确定性，当前不支持自动断点续训。闭环策略改变后，不能沿用冻结 `pi0` 下的校准解释。

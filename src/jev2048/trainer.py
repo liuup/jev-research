@@ -284,6 +284,7 @@ def main():
             step_seconds = time.monotonic() - step_start
             record = dict(
                 step=step + 1,
+                objective=c["objective"],
                 loss=total,
                 gradient_norm=float(norm),
                 gradient_clip_scale=min(1.0, 1.0 / (float(norm) + 1e-6)),
@@ -303,9 +304,13 @@ def main():
                 ),
             )
             if (step + 1) % c["eval_every"] == 0 or step + 1 == c["steps"]:
-                record["dev"] = observed_metrics(
+                dev_metrics = observed_metrics(
                     predict(model, tok, dev, micro, c["max_length"]), dev
                 )
+                save_json(output / "dev" / f"step_{step + 1:06d}.json", dev_metrics)
+                record["dev"] = {
+                    key: value for key, value in dev_metrics.items() if key != "events"
+                }
             log.write(json.dumps(record) + "\n")
             log.flush()
             print(

@@ -1,3 +1,6 @@
+from .env import moved
+
+
 OUTCOMES = ("lt256", "256", "512", "1024", "2048", "4096", "8192_plus")
 DESCRIPTIONS = (
     "less than 256",
@@ -20,10 +23,14 @@ def bucket(tile):
 
 def serialize(row, candidate_id):
     board = "\n".join(" ".join(map(str, r)) for r in row["board"])
+    afterstate, merge_score = moved(row["board"], row["action"])
+    afterstate_text = "\n".join(" ".join(map(str, r)) for r in afterstate)
     description = dict(zip(OUTCOMES, DESCRIPTIONS)).get(candidate_id, candidate_id)
     return (
         f"[STATE]\nGame: 2048\nBoard:\n{board}\nScore: {row['score']}\n"
-        f"MaxTile: {max(map(max, row['board']))}\n\n[QUESTION]\n"
+        f"MaxTile: {max(map(max, row['board']))}\n\n[ACTION]\n{row['action']}\n"
+        f"DeterministicAfterstateBeforeSpawn:\n{afterstate_text}\n"
+        f"ImmediateMergeScore: {merge_score}\n\n[QUESTION]\n"
         f"If {row['action']} is taken now and the frozen continuation policy is followed "
         f"until termination, what will be the terminal maximum tile?\n\n[CANDIDATE]\n{description}"
     )

@@ -1,5 +1,6 @@
 import hashlib
 import json
+import math
 import random
 from pathlib import Path
 
@@ -26,10 +27,13 @@ def seed_all(seed):
 def game_summary(games):
     scores = [g.score for g in games]
     tiles = [g.max_tile for g in games]
+    log_tiles = [math.log2(tile) for tile in tiles]
     return dict(
         games=len(games),
         mean_score=float(np.mean(scores)),
         median_score=float(np.median(scores)),
+        mean_log_tile=float(np.mean(log_tiles)),
+        median_log_tile=float(np.median(log_tiles)),
         max_tile_distribution={str(t): tiles.count(t) for t in sorted(set(tiles))},
         **{
             f"reach_{t}": float(np.mean(np.array(tiles) >= t))

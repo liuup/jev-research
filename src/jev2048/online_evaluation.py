@@ -65,28 +65,28 @@ def play_seeded(policy, seeds, batch_size=8, game_factory=Game, progress=None):
     return dict(policy_id=policy.policy_id, **game_summary(finished), records=records)
 
 
-def promotion_decision(incumbent, candidate, min_relative_gain):
-    if min_relative_gain < 0:
-        raise ValueError("Promotion margin must be nonnegative")
+def promotion_decision(incumbent, candidate, min_log_tile_gain):
+    if min_log_tile_gain < 0:
+        raise ValueError("Expected log-tile gain must be nonnegative")
     if [r["seed"] for r in incumbent["records"]] != [
         r["seed"] for r in candidate["records"]
     ]:
         raise ValueError("Promotion games must use identical seeds")
     differences = np.array(
         [
-            new["score"] - old["score"]
+            np.log2(new["max_tile"]) - np.log2(old["max_tile"])
             for old, new in zip(incumbent["records"], candidate["records"])
         ]
     )
-    threshold = incumbent["mean_score"] * (1 + min_relative_gain)
+    threshold = incumbent["mean_log_tile"] + min_log_tile_gain
     return dict(
-        accepted=bool(candidate["mean_score"] > threshold),
-        metric="mean_score",
-        required_score=threshold,
-        incumbent_mean_score=incumbent["mean_score"],
-        candidate_mean_score=candidate["mean_score"],
-        paired_mean_score_delta=float(differences.mean()),
-        paired_score_delta_se=float(differences.std(ddof=1) / len(differences) ** 0.5)
+        accepted=bool(candidate["mean_log_tile"] > threshold),
+        metric="mean_log_tile",
+        required_mean_log_tile=threshold,
+        incumbent_mean_log_tile=incumbent["mean_log_tile"],
+        candidate_mean_log_tile=candidate["mean_log_tile"],
+        paired_mean_log_tile_delta=float(differences.mean()),
+        paired_log_tile_delta_se=float(differences.std(ddof=1) / len(differences) ** 0.5)
         if len(differences) > 1
         else None,
         games=len(differences),

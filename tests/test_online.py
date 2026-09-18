@@ -258,16 +258,29 @@ def test_batched_controller_question_mapping(monkeypatch):
 
 def test_promotion_and_action_regret():
     old = dict(
-        mean_score=100, records=[dict(seed=1, score=100), dict(seed=2, score=100)]
+        mean_log_tile=8.0,
+        records=[
+            dict(seed=1, score=100, max_tile=256),
+            dict(seed=2, score=100, max_tile=256),
+        ],
     )
     new = dict(
-        mean_score=105, records=[dict(seed=1, score=110), dict(seed=2, score=100)]
+        mean_log_tile=8.5,
+        records=[
+            dict(seed=1, score=110, max_tile=512),
+            dict(seed=2, score=100, max_tile=256),
+        ],
     )
-    assert promotion_decision(old, new, 0.02)["accepted"]
+    decision = promotion_decision(old, new, 0.25)
+    assert decision["accepted"] and decision["metric"] == "mean_log_tile"
     assert not promotion_decision(old, old, 0)["accepted"]
-    assert not promotion_decision(old, new, 0.1)["accepted"]
+    assert not promotion_decision(old, new, 0.5)["accepted"]
     with pytest.raises(ValueError):
-        promotion_decision(old, dict(new, records=[dict(seed=3, score=105)]), 0)
+        promotion_decision(
+            old,
+            dict(new, records=[dict(seed=3, score=105, max_tile=512)]),
+            0,
+        )
     p = np.zeros((2, 7))
     q = p.copy()
     p[0, 4] = 1
@@ -288,6 +301,8 @@ def test_online_config_requires_no_offline_data():
         dict(microbatch=3),
         dict(mc_rollouts=1),
         dict(behavior_epsilon=1.1),
+        dict(min_optimizer_steps_per_policy=30),
+        dict(utility="threshold"),
     ):
         with pytest.raises(ValueError):
             validate_online_config(c | update)
@@ -302,7 +317,7 @@ def test_online_config_requires_no_offline_data():
 def test_two_generation_online_pipeline(tmp_path, monkeypatch):
     torch.manual_seed(17)
     torch.set_num_threads(1)
-    decisions = iter([True, False])
+    decisions = iter([False, True, False, False])
 
     def exercise_both_paths(incumbent, candidate, margin):
         result = promotion_decision(incumbent, candidate, margin)
@@ -311,7 +326,13 @@ def test_two_generation_online_pipeline(tmp_path, monkeypatch):
 
     monkeypatch.setattr(online_trainer, "promotion_decision", exercise_both_paths)
     monkeypatch.setattr(online_trainer, "plot_reliability", lambda *args: None)
-    c = configuration()
+    c = configuration() | dict(
+        max_policy_generations=2,
+        min_optimizer_steps_per_policy=1,
+        max_optimizer_steps_per_policy=2,
+        promotion_interval_steps=1,
+        max_total_optimizer_steps=4,
+    )
     summaries = run_online(
         c,
         tmp_path,
@@ -321,6 +342,8 @@ def test_two_generation_online_pipeline(tmp_path, monkeypatch):
     )
     assert len(summaries) == 2
     assert summaries[0]["accepted"] and not summaries[1]["accepted"]
+    assert summaries[0]["status"] == "promoted"
+    assert summaries[1]["status"] == "policy_stalled"
     assert summaries[1]["target_policy_id"] == summaries[0]["active_policy_id"]
     assert summaries[1]["active_policy_id"] == summaries[0]["active_policy_id"]
     first = [
@@ -333,6 +356,8 @@ def test_two_generation_online_pipeline(tmp_path, monkeypatch):
     ]
     assert not {r["source_game"] for r in first} & {r["source_game"] for r in second}
     assert first[0]["policy_id"] != second[0]["policy_id"]
+    assert len(first) == len(second) == 2 * c["effective_batch"]
+    assert summaries[0]["optimizer_steps"] == summaries[1]["optimizer_steps"] == 2
     assert audit(tmp_path)["success"]
     records = [
         json.loads(line)
@@ -349,5 +374,7 @@ def test_two_generation_online_pipeline(tmp_path, monkeypatch):
         for row in records
     )
     assert (tmp_path / "generation_001/controller_test.json").exists()
+    assert (tmp_path / "generation_000/initial_validation_predictions.json").exists()
+    assert (tmp_path / "generation_000/final_validation_predictions.json").exists()
     with pytest.raises(FileExistsError):
         run_online(c, tmp_path, model=TinyModel(), tokenizer=TinyTokenizer())

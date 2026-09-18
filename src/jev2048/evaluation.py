@@ -11,6 +11,8 @@ from matplotlib.figure import Figure
 from .dataset import collate
 from .serialization import OUTCOMES
 
+LOG_TILE_UTILITIES = np.array([7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0])
+
 
 @contextmanager
 def inference_precision(precision):
@@ -74,10 +76,16 @@ def reliability(p, y, bins=10):
 def observed_metrics(p, rows):
     y = np.array([OUTCOMES.index(r["observed_outcome"]) for r in rows])
     onehot = np.eye(len(OUTCOMES))[y]
+    predicted_log_tile = p @ LOG_TILE_UTILITIES
+    observed_log_tile = LOG_TILE_UTILITIES[y]
     result = dict(
         top1_accuracy=float((p.argmax(-1) == y).mean()),
         observed_nll=float(-np.log(np.maximum(p[np.arange(len(y)), y], 1e-30)).mean()),
         observed_brier=float(((p - onehot) ** 2).sum(-1).mean()),
+        predicted_expected_log_tile=float(predicted_log_tile.mean()),
+        observed_mean_log_tile=float(observed_log_tile.mean()),
+        observed_log_tile_mae=float(abs(predicted_log_tile - observed_log_tile).mean()),
+        observed_log_tile_mse=float(((predicted_log_tile - observed_log_tile) ** 2).mean()),
         events={},
     )
     for threshold in (1024, 2048, 4096):
@@ -97,6 +105,8 @@ def observed_metrics(p, rows):
 def mc_metrics(p, rows):
     q = np.array([r["q"] for r in rows])
     mid = (p + q) / 2
+    predicted_log_tile = p @ LOG_TILE_UTILITIES
+    reference_log_tile = q @ LOG_TILE_UTILITIES
 
     def kl(a, b):
         return (a * (np.log(np.maximum(a, 1e-30)) - np.log(np.maximum(b, 1e-30)))).sum(
@@ -107,6 +117,10 @@ def mc_metrics(p, rows):
         mc_squared_l2=float(((p - q) ** 2).sum(-1).mean()),
         mc_mae=float(abs(p - q).mean()),
         mc_js=float((0.5 * kl(p, mid) + 0.5 * kl(q, mid)).mean()),
+        mc_expected_log_tile_mae=float(abs(predicted_log_tile - reference_log_tile).mean()),
+        mc_expected_log_tile_mse=float(
+            ((predicted_log_tile - reference_log_tile) ** 2).mean()
+        ),
         mc_sampling_squared_l2_floor=float(
             np.mean(
                 [

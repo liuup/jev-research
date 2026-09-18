@@ -11,10 +11,12 @@ By default, it uses the local `/root/shang/hf-modles/Qwen3.5-0.8B-Base` checkpoi
 1. The initial controller is a heuristic policy. At generation `t`, the current controller `πt` is frozen.
 2. Board states are explored online using `πt` mixed with 15% random actions. Every legal action is branched independently from each selected state, after which `πt` plays to termination to produce one observed outcome `Y`.
 3. The model updates `p(y | s,a,πt)`. The default objective is paired-PG with 32 predictive-label samples and a detached conditional baseline. CE and Brier objectives are also supported.
-4. The newly trained model is frozen and converted into a greedy candidate controller. The candidate and incumbent play independent games with matching seeds. The candidate is promoted only if its mean score exceeds the incumbent's by more than 2%; otherwise, the incumbent is retained and the learner continues training.
-5. Feedback is collected again for the next generation. Model weights carry over, while the optimizer is reset.
+4. The newly trained model is frozen and chooses actions by expected terminal `log2(tile)`. Candidate and incumbent use matching game seeds; promotion requires the configured absolute improvement in mean terminal log-tile.
+5. A generation advances only after promotion. Rejection keeps the current generation, model weights, Adam state, and learning-rate progress. Promotion freezes the new policy, resets the optimizer, and starts fresh feedback collection.
 
-No pre-generated training dataset is required. On a single GPU, the workflow alternates between batched sampling and updates. The environment runs on the CPU, while neural-policy inference and training run on a Slurm-managed GPU.
+The input includes both the current board and the deterministic afterstate before random tile spawning, but never the terminal label. No pre-generated dataset is required. Heuristic continuation rollouts use asynchronous CPU prefetch; neural continuation and training use the Slurm-managed GPU.
+
+The main budgets are in `configs/online.yaml`: `max_policy_generations` limits frozen policy versions, `min/max_optimizer_steps_per_policy` bound updates against one target policy, `promotion_interval_steps` controls promotion checks, and `max_total_optimizer_steps` is the global cap.
 
 ## Validation and Launch
 
@@ -33,7 +35,7 @@ sbatch slurm/smoke_gpu.sbatch
 # After the previous job succeeds:
 sbatch slurm/online_smoke.sbatch
 # After the online smoke test completes:
-uv run python scripts/verify_training_smoke.py --run runs/online_smoke
+uv run python scripts/verify_training_smoke.py --run runs/online_expected_log_tile_smoke
 
 # Main experiment (submit manually only when ready)
 sbatch --job-name=jev-online-pg-seed17 slurm/train.sbatch paired_pg
@@ -49,11 +51,11 @@ Configuration is stored in `configs/online.yaml`. Training initializes from the 
 
 Under `runs/online_paired_pg_seed17/`:
 
-- `training.jsonl`: reward, advantage statistics, NLL/Brier, entropy, predicted distributions, sampling/update timing, environment interaction counts, and policy versions; GPU memory is not recorded here.
+- `training.jsonl`: reward, advantage statistics, NLL/Brier, expected-log-tile errors, predicted distributions, and environment interaction counts; GPU memory is not recorded here.
 - `generation_XXX/events.jsonl`: the single-outcome environment feedback actually consumed for updates in that generation. This is an audit log, not a pre-generated training dataset.
-- `generation_XXX/checkpoint.pt`: learner weights. The corresponding prediction target is specified by `target_policy.json`. GPU-memory statistics are stored separately in `training_stats.json`.
+- `generation_XXX/checkpoint.pt`: learner weights used by the latest promotion check. Its prediction target is specified by `target_policy.json`.
 - `generation_XXX/metrics.json`: probability metrics, Monte Carlo action-ranking agreement, and utility regret on fixed holdout boards. Labels and MC probabilities are regenerated each generation under that generation's frozen policy.
-- `promotion.json`: games used for promotion decisions. `controller_test.json`: an independent test set that is not used for promotion.
+- `promotion_step_XXXXXX.json`: each promotion check; `promotion.json` is the latest check. `controller_test.json` is independent and not used for promotion.
 - `active_policy.json`: the policy actually approved to control the game. It may still be the heuristic policy; the latest checkpoint must not automatically be treated as the stronger controller.
 
 ```bash

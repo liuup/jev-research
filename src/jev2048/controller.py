@@ -2,7 +2,7 @@
 
 import numpy as np
 
-from .evaluation import predict
+from .evaluation import LOG_TILE_UTILITIES, predict
 
 
 def outcome_utility(p, utility="threshold", threshold=2048):
@@ -13,7 +13,7 @@ def outcome_utility(p, utility="threshold", threshold=2048):
             -1
         )
     if utility == "log_tile":
-        return p @ np.array([7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0])
+        return p @ LOG_TILE_UTILITIES
     raise ValueError(utility)
 
 

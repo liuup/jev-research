@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=jev-online-smoke-seed17
+#SBATCH --job-name=jev-logtile-smoke-seed17
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem=48G
 #SBATCH --time=48:00:00
 #SBATCH --output=logs/slurm/%x-%j.out
 set -euo pipefail
-export OBJECTIVE=online_paired_pg_smoke
+export OBJECTIVE=online_expected_log_tile_smoke
 source slurm/startup.sh
 uv run python scripts/smoke_test.py
-uv run python scripts/train.py --config configs/online_smoke.yaml --output runs/online_smoke "$@"
-uv run python scripts/verify_training_smoke.py --run runs/online_smoke
+uv run python scripts/train.py --config configs/online_smoke.yaml --output runs/online_expected_log_tile_smoke "$@"
+uv run python scripts/verify_training_smoke.py --run runs/online_expected_log_tile_smoke

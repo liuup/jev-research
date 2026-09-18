@@ -31,8 +31,11 @@ from .utils import digest, save_json
 
 def validate_online_config(c):
     for key in (
-        "generations",
-        "steps_per_generation",
+        "max_policy_generations",
+        "min_optimizer_steps_per_policy",
+        "max_optimizer_steps_per_policy",
+        "promotion_interval_steps",
+        "max_total_optimizer_steps",
         "effective_batch",
         "microbatch",
         "source_envs",
@@ -56,11 +59,17 @@ def validate_online_config(c):
         raise ValueError("MC and paired PG require at least two samples")
     if not 0 <= c["behavior_epsilon"] <= 1:
         raise ValueError("Invalid behavior epsilon")
-    if c["promotion_margin"] < 0 or c["warmup_steps"] < 0:
+    if (
+        c["min_optimizer_steps_per_policy"]
+        > c["max_optimizer_steps_per_policy"]
+        or c["max_total_optimizer_steps"] < c["min_optimizer_steps_per_policy"]
+    ):
+        raise ValueError("Invalid per-policy optimizer-step bounds")
+    if c["promotion_min_log_tile_gain"] < 0 or c["warmup_steps"] < 0:
         raise ValueError("Negative margin or warmup")
     if c["objective"] not in ("ce", "brier", "paired_pg"):
         raise ValueError("Unknown objective")
-    if c["utility"] not in ("threshold", "log_tile") or c["threshold"] not in (
+    if c["utility"] != "log_tile" or c["threshold"] not in (
         256,
         512,
         1024,
@@ -68,7 +77,7 @@ def validate_online_config(c):
         4096,
         8192,
     ):
-        raise ValueError("Invalid controller utility")
+        raise ValueError("Online policy improvement requires expected log-tile utility")
     if "data_dir" in c:
         raise ValueError("Online mode must not depend on an offline data directory")
 
@@ -90,7 +99,7 @@ def probability_evaluation(model, tokenizer, c, questions, policy, generation, o
     p = predict(model, tokenizer, validation, c["inference_questions"], c["max_length"])
     metrics = observed_metrics(p, validation)
     save_json(
-        output / "validation_predictions.json",
+        output / "initial_validation_predictions.json",
         [
             dict(
                 state_id=r["state_id"],
@@ -166,37 +175,43 @@ def run_online(
     summaries = []
     cumulative = dict(behavior_steps=0, rollout_steps=0, terminal_rollouts=0)
     with (output / "training.jsonl").open("w") as log:
-        for generation in range(c["generations"]):
+        generation = 0
+        while (
+            generation < c["max_policy_generations"]
+            and global_step + c["min_optimizer_steps_per_policy"]
+            <= c["max_total_optimizer_steps"]
+        ):
+            target_policy = incumbent
             print(
                 json.dumps(
                     dict(
                         event="generation_start",
                         generation=generation,
-                        target_policy_id=incumbent.policy_id,
+                        target_policy_id=target_policy.policy_id,
                     )
                 ),
                 flush=True,
             )
             folder = output / f"generation_{generation:03d}"
             folder.mkdir()
-            target_spec = copy.deepcopy(incumbent.spec)
+            target_spec = copy.deepcopy(target_policy.spec)
             save_json(folder / "target_policy.json", target_spec)
             async_collection = (
                 c["prefetch_batches"] > 0
-                and incumbent.spec.get("kind") == "heuristic"
+                and target_policy.spec.get("kind") == "heuristic"
                 and game_factory is Game
                 and device.type == "cuda"
             )
             collector = (
                 AsyncOnlineCollector(
-                    incumbent,
+                    target_policy,
                     c,
                     generation,
                     c["effective_batch"],
                     c["prefetch_batches"],
                 )
                 if async_collection
-                else OnlineCollector(incumbent, c, generation, "train", game_factory)
+                else OnlineCollector(target_policy, c, generation, "train", game_factory)
             )
             print(
                 json.dumps(
@@ -210,10 +225,11 @@ def run_online(
                 flush=True,
             )
             validation, initial_metrics = probability_evaluation(
-                model, tokenizer, c, questions, incumbent, generation, folder
+                model, tokenizer, c, questions, target_policy, generation, folder
             )
             save_json(folder / "initial_validation_metrics.json", initial_metrics)
-            # Reset Adam moments/schedule on each evaluation phase; retain learner weights.
+            # A policy generation owns one optimizer. Rejected candidates continue with
+            # the same moments and schedule; a promoted target starts a fresh optimizer.
             optimizer = torch.optim.AdamW(
                 [
                     dict(params=model.backbone.parameters(), lr=c["backbone_lr"]),
@@ -228,8 +244,11 @@ def run_online(
                     return (step + 1) / max(1, c["warmup_steps"])
                 return max(
                     0.0,
-                    (c["steps_per_generation"] - step)
-                    / max(1, c["steps_per_generation"] - c["warmup_steps"]),
+                    (c["max_optimizer_steps_per_policy"] - step)
+                    / max(
+                        1,
+                        c["max_optimizer_steps_per_policy"] - c["warmup_steps"],
+                    ),
                 )
 
             scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, schedule)
@@ -237,13 +256,21 @@ def run_online(
                 torch.cuda.reset_peak_memory_stats()
             train_start = time.monotonic()
             events_file = None
+            candidate = None
+            decision = None
+            old_games = None
+            new_games = None
+            policy_step = 0
             try:
                 events_file = (folder / "events.jsonl").open("w")
-                for local_step in range(c["steps_per_generation"]):
+                while (
+                    policy_step < c["max_optimizer_steps_per_policy"]
+                    and global_step < c["max_total_optimizer_steps"]
+                ):
                     collect_start = time.monotonic()
                     rows = collector.collect(c["effective_batch"])
                     collect_seconds = time.monotonic() - collect_start
-                    validate_events(rows, incumbent.policy_id, generation)
+                    validate_events(rows, target_policy.policy_id, generation)
                     for row in rows:
                         events_file.write(json.dumps(row) + "\n")
                     events_file.flush()
@@ -251,10 +278,11 @@ def run_online(
                         model, tokenizer, rows, optimizer, scheduler, c, micro
                     )
                     global_step += 1
+                    policy_step += 1
                     record.update(
                         step=global_step,
                         generation=generation,
-                        generation_step=local_step + 1,
+                        policy_step=policy_step,
                         collection_seconds=collect_seconds,
                         producer_collection_seconds=getattr(
                             collector, "producer_seconds", collect_seconds
@@ -268,9 +296,11 @@ def run_online(
                     )
                     record.pop("step_seconds", None)
                     record.pop("questions_per_second", None)
-                    if (local_step + 1) % c["eval_every"] == 0 or local_step + 1 == c[
-                        "steps_per_generation"
-                    ]:
+                    at_policy_limit = (
+                        policy_step == c["max_optimizer_steps_per_policy"]
+                        or global_step == c["max_total_optimizer_steps"]
+                    )
+                    if policy_step % c["eval_every"] == 0 or at_policy_limit:
                         metrics = observed_metrics(
                             predict(
                                 model,
@@ -282,7 +312,7 @@ def run_online(
                             validation,
                         )
                         save_json(
-                            folder / "dev" / f"step_{local_step + 1:06d}.json", metrics
+                            folder / "dev" / f"step_{policy_step:06d}.json", metrics
                         )
                         record["dev"] = {
                             k: v for k, v in metrics.items() if k != "events"
@@ -290,10 +320,100 @@ def run_online(
                     log.write(json.dumps(record) + "\n")
                     log.flush()
                     print(json.dumps(record), flush=True)
+
+                    eligible = policy_step >= c["min_optimizer_steps_per_policy"]
+                    scheduled = (
+                        policy_step == c["min_optimizer_steps_per_policy"]
+                        or (
+                            policy_step > c["min_optimizer_steps_per_policy"]
+                            and (
+                                policy_step - c["min_optimizer_steps_per_policy"]
+                            )
+                            % c["promotion_interval_steps"]
+                            == 0
+                        )
+                    )
+                    if not eligible or not (scheduled or at_policy_limit):
+                        continue
+                    saved_config = dict(c, microbatch=micro)
+                    checkpoint(
+                        folder / "checkpoint.pt",
+                        model,
+                        saved_config,
+                        kind="online_generation",
+                        generation=generation,
+                        policy_step=policy_step,
+                        step=global_step,
+                        target_policy=target_spec,
+                        optimizer=optimizer.state_dict() if c["save_optimizer"] else None,
+                        scheduler=scheduler.state_dict(),
+                        torch_rng=torch.get_rng_state(),
+                        cuda_rng=torch.cuda.get_rng_state()
+                        if device.type == "cuda"
+                        else None,
+                        metadata=metadata,
+                    )
+                    candidate = snapshot_candidate(
+                        model,
+                        tokenizer,
+                        folder / "checkpoint.pt",
+                        c,
+                        target_policy.policy_id,
+                    )
+                    promotion_seeds = [
+                        stream_seed(c["seed"], generation, policy_step, "promotion", i)
+                        for i in range(c["promotion_games"])
+                    ]
+                    old_games = play_seeded(
+                        target_policy,
+                        promotion_seeds,
+                        c["game_batch"],
+                        game_factory,
+                        progress=dict(
+                            generation=generation,
+                            policy_step=policy_step,
+                            phase="promotion",
+                            role="incumbent",
+                        ),
+                    )
+                    new_games = play_seeded(
+                        candidate,
+                        promotion_seeds,
+                        c["game_batch"],
+                        game_factory,
+                        progress=dict(
+                            generation=generation,
+                            policy_step=policy_step,
+                            phase="promotion",
+                            role="candidate",
+                        ),
+                    )
+                    decision = promotion_decision(
+                        old_games,
+                        new_games,
+                        c["promotion_min_log_tile_gain"],
+                    )
+                    promotion_report = dict(
+                        policy_step=policy_step,
+                        decision=decision,
+                        incumbent=old_games,
+                        candidate=new_games,
+                    )
+                    save_json(
+                        folder / f"promotion_step_{policy_step:06d}.json",
+                        promotion_report,
+                    )
+                    save_json(folder / "promotion.json", promotion_report)
+                    if decision["accepted"] or at_policy_limit:
+                        break
+                    del candidate
+                    candidate = None
             finally:
                 collector.close()
                 if events_file is not None:
                     events_file.close()
+            if candidate is None or decision is None:
+                raise RuntimeError("Policy phase ended without an eligible promotion check")
             training_stats = dict(
                 training_seconds=time.monotonic() - train_start,
                 actual_microbatch=micro,
@@ -306,27 +426,32 @@ def run_online(
             )
             for key in cumulative:
                 cumulative[key] += collector.counters[key]
-            saved_config = dict(c, microbatch=micro)
-            checkpoint(
-                folder / "checkpoint.pt",
-                model,
-                saved_config,
-                kind="online_generation",
-                generation=generation,
-                step=global_step,
-                target_policy=target_spec,
-                optimizer=optimizer.state_dict() if c["save_optimizer"] else None,
-                scheduler=scheduler.state_dict(),
-                torch_rng=torch.get_rng_state(),
-                cuda_rng=torch.cuda.get_rng_state() if device.type == "cuda" else None,
-                metadata=metadata,
+
+            final_p = predict(
+                model, tokenizer, validation, c["inference_questions"], c["max_length"]
             )
-            del optimizer, scheduler
+            metrics = observed_metrics(final_p, validation)
+            save_json(
+                folder / "final_validation_predictions.json",
+                [
+                    dict(
+                        state_id=row["state_id"],
+                        action=row["action"],
+                        observed_outcome=row["observed_outcome"],
+                        p=probability.tolist(),
+                    )
+                    for row, probability in zip(validation, final_p)
+                ],
+            )
             mc_rows, mc_steps = mc_reference(
                 retarget_questions(
-                    mc_questions, incumbent.policy_id, generation, c["seed"], "mc"
+                    mc_questions,
+                    target_policy.policy_id,
+                    generation,
+                    c["seed"],
+                    "mc",
                 ),
-                incumbent,
+                target_policy,
                 c["mc_rollouts"],
                 stream_seed(c["seed"], generation, "mc_repeats"),
                 c["inference_questions"],
@@ -341,39 +466,20 @@ def run_online(
                 mc_p, mc_rows, c["utility"], c["threshold"]
             )
             metrics.update(
-                target_policy_id=incumbent.policy_id,
+                target_policy_id=target_policy.policy_id,
                 generation=generation,
+                policy_step=policy_step,
                 mc_environment_steps=mc_steps,
             )
             save_json(folder / "metrics.json", metrics)
             plot_reliability(metrics, f"{output.name}_g{generation:03d}")
-            candidate = snapshot_candidate(
-                model, tokenizer, folder / "checkpoint.pt", c, incumbent.policy_id
-            )
             save_json(folder / "candidate_policy.json", candidate.spec)
-            promotion_seeds = [
-                stream_seed(c["seed"], generation, "promotion", i)
-                for i in range(c["promotion_games"])
-            ]
-            old_games = play_seeded(
-                incumbent, promotion_seeds, c["game_batch"], game_factory,
-                progress=dict(generation=generation, phase="promotion", role="incumbent"),
-            )
-            new_games = play_seeded(
-                candidate, promotion_seeds, c["game_batch"], game_factory,
-                progress=dict(generation=generation, phase="promotion", role="candidate"),
-            )
-            decision = promotion_decision(old_games, new_games, c["promotion_margin"])
-            save_json(
-                folder / "promotion.json",
-                dict(decision=decision, incumbent=old_games, candidate=new_games),
-            )
             # Reporting games are never used by the acceptance rule.
             test_seeds = [
                 stream_seed(c["seed"], "test_games", i) for i in range(c["test_games"])
             ]
             test_old = play_seeded(
-                incumbent, test_seeds, c["game_batch"], game_factory,
+                target_policy, test_seeds, c["game_batch"], game_factory,
                 progress=dict(generation=generation, phase="test", role="incumbent"),
             )
             test_new = play_seeded(
@@ -390,7 +496,6 @@ def run_online(
             )
             if decision["accepted"]:
                 incumbent = candidate
-            del candidate, collector
             save_json(folder / "active_policy.json", incumbent.spec)
             save_json(output / "active_policy.json", incumbent.spec)
             summary = dict(
@@ -400,6 +505,8 @@ def run_online(
                 target_policy_id=target_spec["policy_id"],
                 active_policy_id=incumbent.policy_id,
                 accepted=decision["accepted"],
+                status="promoted" if decision["accepted"] else "policy_stalled",
+                optimizer_steps=policy_step,
                 probability={k: v for k, v in metrics.items() if k != "events"},
                 candidate_test={k: v for k, v in test_new.items() if k != "records"},
                 incumbent_test={k: v for k, v in test_old.items() if k != "records"},
@@ -409,6 +516,10 @@ def run_online(
             summaries.append(summary)
             save_json(output / "generations.json", summaries)
             print(json.dumps(dict(generation_complete=summary)), flush=True)
+            del optimizer, scheduler, collector
+            if not decision["accepted"]:
+                break
+            generation += 1
     return summaries
 
 

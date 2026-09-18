@@ -25,8 +25,14 @@ if __name__ == "__main__":
                 success=True,
                 mode=config["mode"],
                 objective=config["objective"],
-                generations=config["generations"],
-                steps_per_generation=config["steps_per_generation"],
+                max_policy_generations=config["max_policy_generations"],
+                min_optimizer_steps_per_policy=config[
+                    "min_optimizer_steps_per_policy"
+                ],
+                max_optimizer_steps_per_policy=config[
+                    "max_optimizer_steps_per_policy"
+                ],
+                max_total_optimizer_steps=config["max_total_optimizer_steps"],
                 requires_offline_dataset=False,
                 submits_jobs=False,
             ),

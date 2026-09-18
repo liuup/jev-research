@@ -11,10 +11,12 @@
 1. 初始控制器为启发式策略。每代冻结当前控制器 `πt`。
 2. 用 `πt + 15% 随机动作` 在线探索棋盘，对选中状态的每个合法动作独立分支；后续严格由 `πt` 玩到终局，取得一次观测 `Y`。
 3. 更新 `p(y | s,a,πt)`；默认 paired-PG，32 个预测标签抽样，保留 detached 条件基线。也支持 CE/Brier。
-4. 冻结新模型，构造贪心候选控制器。用独立同种子对局比较候选与当前策略，均分提高超过 2% 才晋升；否则保留当前策略，学习器继续训练。
-5. 下一代重新采集反馈。权重延续、优化器重置.
+4. 冻结新模型，按终局桶的 `log2(tile)` 期望选择动作。候选与当前策略使用相同种子对局；平均终局 log-tile 达到配置的绝对提升才晋升。
+5. 只有策略晋升才增加 generation。晋升失败时继续当前 generation，并保留模型权重、Adam 状态和学习率进度；晋升后冻结新策略、重置优化器并重新采集反馈。
 
-无需预生成训练集。单卡采用同步“批量采样→更新”；环境在 CPU 执行，神经策略推理和训练都在 Slurm GPU 上执行
+输入同时包含原棋盘和执行候选动作后的确定性 afterstate（随机生成新砖之前），但不包含终局标签。无需预生成训练集；启发式 continuation 使用 CPU 异步预取，神经 continuation 和训练均在 Slurm GPU 上执行。
+
+核心预算位于 `configs/online.yaml`：`max_policy_generations` 限制冻结策略版本数，`min/max_optimizer_steps_per_policy` 限制同一目标策略下的更新数，`promotion_interval_steps` 控制晋升检查频率，`max_total_optimizer_steps` 提供全局上限。
 
 ## 验证与启动
 
@@ -33,7 +35,7 @@ sbatch slurm/smoke_gpu.sbatch
 # 上一作业通过后：
 sbatch slurm/online_smoke.sbatch
 # 在线 smoke 完成后：
-uv run python scripts/verify_training_smoke.py --run runs/online_smoke
+uv run python scripts/verify_training_smoke.py --run runs/online_expected_log_tile_smoke
 
 # 主实验（仅在准备好后手动提交）
 sbatch --job-name=jev-online-pg-seed17 slurm/train.sbatch paired_pg
@@ -49,11 +51,11 @@ bash slurm/status.sh
 
 `runs/online_paired_pg_seed17/`：
 
-- `training.jsonl`：reward、优势统计、NLL/Brier、熵、预测分布、采样/更新耗时、环境交互量及策略版本；不记录显存。
+- `training.jsonl`：reward、优势统计、NLL/Brier、expected log-tile 误差、预测分布及环境交互量；不记录显存。
 - `generation_XXX/events.jsonl`：本代实际用于更新的单次环境反馈，作为审计记录，不是预生成训练集。
-- `generation_XXX/checkpoint.pt`：学习器权重；其预测目标由 `target_policy.json` 指定。显存统计另存 `training_stats.json`。
+- `generation_XXX/checkpoint.pt`：最后一次晋升检查使用的学习器权重；其预测目标由 `target_policy.json` 指定。
 - `generation_XXX/metrics.json`：固定 holdout 棋盘上的概率指标、MC 动作排序一致率和效用 regret。每代按对应冻结策略重采标签与 MC 概率。
-- `promotion.json`：晋升用对局；`controller_test.json`：独立测试对局，不参与晋升决定。
+- `promotion_step_XXXXXX.json`：各次晋升检查；`promotion.json` 是最后一次检查；`controller_test.json` 是不参与晋升的独立测试。
 - `active_policy.json`：真正获准接管的策略，可能仍是启发式；不能把最后一个 checkpoint 自动当成更好的控制器。
 
 ```bash

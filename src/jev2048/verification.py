@@ -17,11 +17,12 @@ def audit(run, require_gpu=False):
     c = metadata["config"]
     assert c["mode"] == "online" and c["objective"] == "paired_pg"
     generations = json.loads((root / "generations.json").read_text())
-    assert len(generations) == c["generations"] >= 2
+    assert 1 <= len(generations) <= c["max_policy_generations"]
     rows = [
         json.loads(line) for line in (root / "training.jsonl").read_text().splitlines()
     ]
-    assert len(rows) == c["generations"] * c["steps_per_generation"]
+    assert len(rows) == sum(generation["optimizer_steps"] for generation in generations)
+    assert len(rows) <= c["max_total_optimizer_steps"]
     assert all(math.isfinite(row["loss"]) and row["gradient_norm"] > 0 for row in rows)
     assert all("peak_gpu_gib" not in row for row in rows)
     initial = torch.load(
@@ -52,7 +53,10 @@ def audit(run, require_gpu=False):
             .splitlines()
         ]
         validate_events(events, previous, number)
-        assert len(events) == c["steps_per_generation"] * c["effective_batch"]
+        assert len(events) == generation["optimizer_steps"] * c["effective_batch"]
+        assert generation["status"] in ("promoted", "policy_stalled")
+        if number + 1 < len(generations):
+            assert generation["status"] == "promoted"
         previous = generation["active_policy_id"]
     return dict(
         success=True,

@@ -18,8 +18,11 @@ def test_perfect_predictions():
         and result["observed_brier"] == 0
     )
     assert result["ece_ge2048"] == 0
-    assert mc_metrics(p, rows)["mc_squared_l2"] == 0
-    assert mc_metrics(p, rows)["mc_js"] == 0
+    assert result["observed_log_tile_mae"] == 0
+    mc = mc_metrics(p, rows)
+    assert mc["mc_squared_l2"] == 0
+    assert mc["mc_js"] == 0
+    assert mc["mc_expected_log_tile_mae"] == 0
 
 
 def test_bin_boundaries():

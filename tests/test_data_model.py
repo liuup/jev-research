@@ -26,6 +26,8 @@ def test_buckets_and_serialization():
     a = serialize(r, "512")
     r["observed_outcome"] = "4096"
     assert a == serialize(r, "512") and a.endswith("[CANDIDATE]\n512")
+    assert "DeterministicAfterstateBeforeSpawn:" in a
+    assert "ImmediateMergeScore:" in a
 
 
 class Tokenizer:

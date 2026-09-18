@@ -21,11 +21,16 @@ The main budgets are in `configs/online.yaml`: `max_policy_generations` limits f
 ## Validation and Launch
 
 ```bash
-uv sync --locked
-uv run pytest -q
-uvx ruff check src scripts tests
-uv run python scripts/validate_online.py
+source /mnt/apps/manual/miniforge3/25.3.1-0_gcc-11.4.1/etc/profile.d/conda.sh
+conda activate pytorch
+export LD_LIBRARY_PATH=/mnt/apps/manual/miniforge3/25.3.1-0_gcc-11.4.1/lib:${LD_LIBRARY_PATH:-}
+export PYTHONPATH="$PWD/src${PYTHONPATH:+:$PYTHONPATH}"
+python -m pytest -q
+python -m ruff check src scripts tests
+python scripts/validate_online.py
 ```
+
+The cluster startup script activates the shared `pytorch` Conda environment. The Qwen 3.5 runtime is currently completed by PyTorch 2.10, Transformers 5.5, and Triton 3.6 from `~/.local`; the shared environment's PyTorch 2.5.1/Triton 3.1 stack is incompatible with this model. Install `pytest` and `ruff` before running tests and lint checks.
 
 The commands below run GPU validation and training. Complete both smoke-test stages and verify their success before launching the main experiment:
 
@@ -35,7 +40,7 @@ sbatch slurm/smoke_gpu.sbatch
 # After the previous job succeeds:
 sbatch slurm/online_smoke.sbatch
 # After the online smoke test completes:
-uv run python scripts/verify_training_smoke.py --run runs/online_expected_log_tile_smoke
+python scripts/verify_training_smoke.py --run runs/online_expected_log_tile_smoke
 
 # Main experiment (submit manually only when ready)
 sbatch --job-name=jev-online-pg-seed17 slurm/train.sbatch paired_pg
@@ -61,7 +66,7 @@ Under `runs/online_paired_pg_seed17/`:
 ```bash
 sbatch slurm/evaluate.sbatch --run runs/online_paired_pg_seed17/generation_000
 sbatch slurm/play.sbatch --run runs/online_paired_pg_seed17 --policy active --games 100 --seed 0
-uv run python scripts/summarize.py
+python scripts/summarize.py
 ```
 
 Summary outputs are written to `results/comparison.{csv,json,md}`, with probability metrics and closed-loop scores kept in separate tables. Training, holdout, MC, promotion, and test data use isolated random streams. Holdout boards remain fixed, and MC labels are used for evaluation only.

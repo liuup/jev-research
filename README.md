@@ -21,11 +21,16 @@
 ## 验证与启动
 
 ```bash
-uv sync --locked
-uv run pytest -q
-uvx ruff check src scripts tests
-uv run python scripts/validate_online.py
+source /mnt/apps/manual/miniforge3/25.3.1-0_gcc-11.4.1/etc/profile.d/conda.sh
+conda activate pytorch
+export LD_LIBRARY_PATH=/mnt/apps/manual/miniforge3/25.3.1-0_gcc-11.4.1/lib:${LD_LIBRARY_PATH:-}
+export PYTHONPATH="$PWD/src${PYTHONPATH:+:$PYTHONPATH}"
+python -m pytest -q
+python -m ruff check src scripts tests
+python scripts/validate_online.py
 ```
+
+集群启动脚本会激活共享 `pytorch` Conda 环境。Qwen 3.5 运行栈当前由 `~/.local` 中的 PyTorch 2.10、Transformers 5.5 和 Triton 3.6 补齐；共享环境自带的 PyTorch 2.5.1/Triton 3.1 与该模型不兼容。运行测试和代码检查前还需分别安装 `pytest` 与 `ruff`。
 
 以下是之后的 GPU 验证/训练命令。先完成两阶段 smoke 并检查成功，再启动主实验：
 
@@ -35,7 +40,7 @@ sbatch slurm/smoke_gpu.sbatch
 # 上一作业通过后：
 sbatch slurm/online_smoke.sbatch
 # 在线 smoke 完成后：
-uv run python scripts/verify_training_smoke.py --run runs/online_expected_log_tile_smoke
+python scripts/verify_training_smoke.py --run runs/online_expected_log_tile_smoke
 
 # 主实验（仅在准备好后手动提交）
 sbatch --job-name=jev-online-pg-seed17 slurm/train.sbatch paired_pg
@@ -61,7 +66,7 @@ bash slurm/status.sh
 ```bash
 sbatch slurm/evaluate.sbatch --run runs/online_paired_pg_seed17/generation_000
 sbatch slurm/play.sbatch --run runs/online_paired_pg_seed17 --policy active --games 100 --seed 0
-uv run python scripts/summarize.py
+python scripts/summarize.py
 ```
 
 汇总输出为 `results/comparison.{csv,json,md}`，概率指标与闭环得分分表保存。训练、holdout、MC、晋升和测试使用隔离随机流；holdout 棋盘固定，MC 标签只用于评估。

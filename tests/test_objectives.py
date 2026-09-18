@@ -6,6 +6,23 @@ import torch
 from jev2048.objectives import loss, masked_log_probs, paired_pg
 
 
+def test_pg_diagnostics_preserve_gradient_and_reward():
+    z = torch.tensor([[0.2, -0.3, 0.7]], dtype=torch.float64, requires_grad=True)
+    draws = torch.tensor([[0, 2, 2, 1]])
+    y = torch.tensor([2])
+    diagnostics = {}
+    plain = paired_pg(z.log_softmax(-1), y, draws=draws)
+    logged = paired_pg(z.log_softmax(-1), y, draws=draws, diagnostics=diagnostics)
+    torch.testing.assert_close(plain, logged)
+    torch.testing.assert_close(
+        torch.autograd.grad(plain, z)[0], torch.autograd.grad(logged, z)[0]
+    )
+    assert all(not value.requires_grad for value in diagnostics.values())
+    assert diagnostics["sampled_hit_rate"].item() == 0.5
+    assert diagnostics["sampled_collision_rate"].item() == pytest.approx(1 / 6)
+    assert diagnostics["sampled_reward"].item() == pytest.approx(5 / 6)
+
+
 @pytest.mark.parametrize("k,m", [(2, 2), (3, 2), (2, 3)])
 @pytest.mark.parametrize("baseline", ["conditional", "zero"])
 def test_exact_gradient(k, m, baseline):

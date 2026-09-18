@@ -10,7 +10,9 @@ def masked_log_probs(logits, mask):
     return F.log_softmax(logits.float().masked_fill(~mask, -torch.inf), dim=-1)
 
 
-def paired_pg(logp, targets, samples=32, baseline="conditional", draws=None):
+def paired_pg(
+    logp, targets, samples=32, baseline="conditional", draws=None, diagnostics=None
+):
     p = logp.exp()
     if draws is None:
         draws = torch.multinomial(p, samples, replacement=True)
@@ -34,14 +36,30 @@ def paired_pg(logp, targets, samples=32, baseline="conditional", draws=None):
         else:
             raise ValueError(baseline)
         advantage = rewards - b
+        if diagnostics is not None:
+            hit_rate = (draws == targets[:, None]).to(p.dtype).mean(1)
+            collision = (counts * (counts - 1)).sum(1) / (m * (m - 1))
+            diagnostics.update(
+                sampled_reward=(2 * hit_rate - collision).mean(),
+                sampled_hit_rate=hit_rate.mean(),
+                sampled_collision_rate=collision.mean(),
+                advantage_mean=advantage.mean(),
+                advantage_second_moment=advantage.square().mean(),
+                advantage_abs_mean=advantage.abs().mean(),
+                advantage_positive_fraction=(advantage > 0).to(p.dtype).mean(),
+                baseline_mean=torch.as_tensor(b, device=p.device, dtype=p.dtype).mean(),
+                per_sample_reward_mean=rewards.mean(),
+            )
     return -(advantage * logp.gather(1, draws)).sum(1).mean()
 
 
-def loss(logp, targets, objective, samples=32, baseline="conditional"):
+def loss(
+    logp, targets, objective, samples=32, baseline="conditional", diagnostics=None
+):
     if objective == "ce":
         return -logp.gather(1, targets[:, None]).mean()
     if objective == "brier":
         return ((logp.exp() - F.one_hot(targets, logp.shape[-1])) ** 2).sum(-1).mean()
     if objective == "paired_pg":
-        return paired_pg(logp, targets, samples, baseline)
+        return paired_pg(logp, targets, samples, baseline, diagnostics=diagnostics)
     raise ValueError(objective)

@@ -8,5 +8,4 @@ test -f runs/common_init.pt
 for objective in paired_pg ce brier; do
     job=$(sbatch --parsable --job-name="jev-${objective}-seed17" slurm/train.sbatch "$objective" "$@")
     echo "$objective: $job"
-    printf '%s\n' "$job" >> logs/submitted_jobs.txt
 done

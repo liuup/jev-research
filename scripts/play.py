@@ -1,5 +1,7 @@
 import argparse
 import json
+import time
+from pathlib import Path
 
 from jev2048.controller import JevController
 from jev2048.env import Game
@@ -15,6 +17,10 @@ if __name__ == "__main__":
     p.add_argument("--utility", choices=["threshold", "log_tile"], default="threshold")
     p.add_argument("--threshold", type=int, default=2048)
     a = p.parse_args()
+    output = Path(a.run) / f"controller_{a.utility}.json"
+    game_log = output.with_suffix(".jsonl")
+    if output.exists() or game_log.exists():
+        raise FileExistsError(f"Evaluation output already exists: {output}")
     require_slurm()
     seed_all(a.seed)
     model, saved = load_checkpoint(a.run + "/checkpoint.pt")
@@ -28,17 +34,35 @@ if __name__ == "__main__":
         model, load_tokenizer(c["base_model"]), a.utility, a.threshold, c["max_length"]
     )
     games = []
-    for seed in range(a.seed, a.seed + a.games):
-        g = Game(seed)
-        while not g.terminal:
-            g.step(controller.choose(g))
-        games.append(g)
-        print(dict(seed=seed, score=g.score, max_tile=g.max_tile), flush=True)
+    total_seconds = 0.0
+    with game_log.open("w") as log:
+        for seed in range(a.seed, a.seed + a.games):
+            start = time.perf_counter()
+            g = Game(seed)
+            while not g.terminal:
+                g.step(controller.choose(g))
+            elapsed = time.perf_counter() - start
+            total_seconds += elapsed
+            games.append(g)
+            record = dict(
+                seed=seed,
+                score=g.score,
+                max_tile=g.max_tile,
+                steps=g.steps,
+                seconds=elapsed,
+                seconds_per_step=elapsed / g.steps,
+            )
+            log.write(json.dumps(record) + "\n")
+            log.flush()
+            print(json.dumps(record), flush=True)
     report = game_summary(games) | dict(
         seed=a.seed,
         utility=a.utility,
         threshold=a.threshold,
+        total_seconds=total_seconds,
+        mean_game_seconds=total_seconds / len(games),
+        seconds_per_step=total_seconds / sum(g.steps for g in games),
         interpretation="Closed-loop demonstration only; predictions target frozen pi0, not this controller",
     )
-    save_json(a.run + f"/controller_{a.utility}.json", report)
+    save_json(output, report)
     print(report)

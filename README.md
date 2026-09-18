@@ -1,6 +1,6 @@
 # Online Jev / RLCD-inspired 2048
 
-通过环境终局反馈，交替进行**结果分布学习和闭环策略改进**。默认使用本地 `/root/shang/hf-modles/Qwen3.5-0.8B-Base`，全参数训练文本骨干与候选集合评分头，不使用视觉塔、LM 输出头或自回归生成。
+通过环境终局反馈，交替进行**结果分布学习和闭环策略改进**。默认使用本地 `/root/shang/hf-modles/Qwen3.5-0.8B-Base`，全参数训练文本骨干与候选集合评分头。
 
 ## 在线流程
 
@@ -59,7 +59,3 @@ uv run python scripts/summarize.py
 ```
 
 汇总输出为 `results/comparison.{csv,json,md}`，概率指标与闭环得分分表保存。训练、holdout、MC、晋升和测试使用隔离随机流；holdout 棋盘固定，MC 标签只用于评估。
-
-结果概率不等于动作策略概率，预测更准不保证控制更强。这是分代近似策略迭代，不是直接对游戏动作做 REINFORCE，也不是官方 TypeSafe RLCD 算法。小样本晋升可能误判；单 seed 不能证明优越性。GPU 不保证逐位确定性，暂不支持自动断点续训。
-
-旧离线工具仅用于复现，入口配置为 `configs/offline_legacy.yaml`；新流程不读取旧数据。旧实验产物已移出项目，恢复目录：`/root/shang/jev-research-legacy-results.l7TDJr`。

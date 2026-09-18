@@ -263,6 +263,11 @@ def test_two_generation_online_pipeline(tmp_path, monkeypatch):
         for line in (tmp_path / "training.jsonl").read_text().splitlines()
     ]
     assert all("peak_gpu_gib" not in row for row in records)
+    excluded_fields = {
+        "step_seconds", "questions_per_second", "target_policy_id", "elapsed_seconds"
+    }
+    assert all(excluded_fields.isdisjoint(row) for row in records)
+    assert not (tmp_path / "generation_000/training_stats.json").exists()
     assert all(
         "collection_seconds" in row and row["environment"]["terminal_rollouts"] > 0
         for row in records

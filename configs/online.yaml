@@ -18,7 +18,7 @@ heuristic_config: configs/heuristic.yaml
 source_envs: 4
 behavior_epsilon: 0.15
 select_every: 16
-inference_questions: 16
+inference_questions: 32
 validation_questions: 64
 mc_states: 4
 mc_rollouts: 32

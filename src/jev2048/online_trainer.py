@@ -161,7 +161,6 @@ def run_online(
     global_step = 0
     micro = c["microbatch"]
     summaries = []
-    started = time.monotonic()
     cumulative = dict(behavior_steps=0, rollout_steps=0, terminal_rollouts=0)
     with (output / "training.jsonl").open("w") as log:
         for generation in range(c["generations"]):
@@ -224,7 +223,6 @@ def run_online(
                         step=global_step,
                         generation=generation,
                         generation_step=local_step + 1,
-                        target_policy_id=incumbent.policy_id,
                         collection_seconds=collect_seconds,
                         online_questions_per_second=len(rows)
                         / (collect_seconds + record["step_seconds"]),
@@ -232,8 +230,9 @@ def run_online(
                         cumulative_environment={
                             k: cumulative[k] + collector.counters[k] for k in cumulative
                         },
-                        elapsed_seconds=time.monotonic() - started,
                     )
+                    record.pop("step_seconds", None)
+                    record.pop("questions_per_second", None)
                     if (local_step + 1) % c["eval_every"] == 0 or local_step + 1 == c[
                         "steps_per_generation"
                     ]:
@@ -266,7 +265,6 @@ def run_online(
                 if device.type == "cuda"
                 else 0,
             )
-            save_json(folder / "training_stats.json", training_stats)
             for key in cumulative:
                 cumulative[key] += collector.counters[key]
             saved_config = dict(c, microbatch=micro)

@@ -45,3 +45,19 @@ def test_split_isolation():
     c=yaml.safe_load(open("configs/data.yaml"))
     ranges=[set(range(seed,seed+100000)) for seed in c["split_seeds"].values()]
     assert all(not a&b for i,a in enumerate(ranges) for b in ranges[i+1:])
+
+def test_generated_smoke_split_isolation():
+    from pathlib import Path
+    from jev2048.dataset import read_rows
+    if not Path("data/smoke/manifest.json").exists():
+        import pytest
+        pytest.skip("Generate smoke data for artifact audit")
+    splits=[read_rows(f"data/smoke/{s}.jsonl") for s in ("train","dev","calibration","test")]
+    groups=[set(r["source_game"] for r in rows) for rows in splits]
+    assert all(not a&b for i,a in enumerate(groups) for b in groups[i+1:])
+    for rows in splits:
+        for r in rows:
+            game=Game(board=r["board"],score=r["score"],steps=r["steps"])
+            actions=[x["action"] for x in rows if x["state_id"]==r["state_id"]]
+            assert actions==game.legal_actions
+            assert "q" not in r and r["observed_outcome"] in OUTCOMES

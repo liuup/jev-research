@@ -9,3 +9,4 @@ set -euo pipefail
 export OBJECTIVE=closed_loop_demo
 source slurm/startup.sh
 uv run python scripts/play.py "$@"
+uv run python scripts/summarize.py

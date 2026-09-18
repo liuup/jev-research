@@ -36,7 +36,7 @@ def checkpoint(path,model,config,**extra):
     torch.save(dict(model=model.state_dict(),config=config,**extra),path)
 
 def load_checkpoint(path):
-    saved=torch.load(path,map_location="cpu",weights_only=False)
+    saved=torch.load(path,map_location="cpu",weights_only=False,mmap=True)
     model=JevModel.load_base(saved["config"]).float()
     model.load_state_dict(saved["model"],strict=True)
     return model.cuda(),saved
@@ -53,6 +53,9 @@ def evaluate_run(model,tok,config,output):
         if split=="test": report.update(metrics); plot_reliability(metrics,output.name)
     mcpath=root/"mc_reference.jsonl"
     if mcpath.exists():
+        mc_manifest=json.loads((root/"mc_manifest.json").read_text())
+        assert mc_manifest["data_manifest_sha256"]==digest(root/"manifest.json")
+        assert mc_manifest["sha256"]==digest(mcpath)
         rows=read_rows(mcpath); probs=predict(model,tok,rows,config["microbatch"],config["max_length"])
         report.update(mc_metrics(probs,rows)); save_json(output/"mc_predictions.json",[dict(state_id=r["state_id"],action=r["action"],probabilities=p.tolist(),q=r["q"]) for r,p in zip(rows,probs)])
     save_json(output/"metrics.json",report)
@@ -75,7 +78,7 @@ def main():
     rows=read_rows(root/"train.jsonl"); dev=read_rows(root/"dev.jsonl")[:c["eval_questions"]]
     assert all("q" not in r for r in rows)
     output=Path(args.output or f"runs/{c['objective']}_seed{c['seed']}"); output.mkdir(parents=True,exist_ok=True)
-    if (output/"checkpoint.pt").exists(): raise FileExistsError(output)
+    if any(output.iterdir()): raise FileExistsError(f"Use a fresh run directory: {output}")
     model,saved=load_checkpoint(c["common_init"])
     assert saved["kind"]=="common_initialization_no_warmup"
     for key in ("base_model","head_width","attention_heads","seed"):
@@ -93,9 +96,12 @@ def main():
     while len(indices)<c["steps"]*c["effective_batch"]: indices.extend(rng.permutation(len(rows)).tolist())
     indices=indices[:c["steps"]*c["effective_batch"]]
     meta=dict(config=c,git_commit=subprocess.check_output(["git","rev-parse","HEAD"],text=True).strip(),
+        git_dirty=bool(subprocess.check_output(["git","status","--porcelain"],text=True).strip()),
+        versions=dict(torch=torch.__version__),
         data_manifest_sha256=digest(root/"manifest.json"),common_init_sha256=digest(c["common_init"]),
         batch_schedule_sha256=hashlib.sha256(np.array(indices,dtype=np.int64).tobytes()).hexdigest(),slurm_job_id=os.environ["SLURM_JOB_ID"])
     save_json(output/"resolved_config.json",meta)
+    (output/"resolved_config.yaml").write_text(yaml.safe_dump(c))
     torch.cuda.reset_peak_memory_stats(); start=time.monotonic(); micro=c["microbatch"]
     with (output/"training.jsonl").open("w") as log:
         for step in range(c["steps"]):
@@ -109,8 +115,7 @@ def main():
                         with torch.autocast("cuda",dtype=torch.bfloat16): lp=model(batch)
                         l=loss(lp,batch["targets"].cuda(),c["objective"],c["reward_samples"],c["baseline"])*len(subset)/len(batch_rows)
                         l.backward(); total+=float(l.detach())
-                    norm=torch.nn.utils.clip_grad_norm_(model.parameters(),1.,error_if_nonfinite=True)
-                    optimizer.step(); scheduler.step(); break
+                    break
                 except torch.cuda.OutOfMemoryError:
                     if micro==1: raise
                     optimizer.zero_grad(set_to_none=True)
@@ -119,6 +124,9 @@ def main():
                     micro=max(1,micro//2); torch.cuda.empty_cache()
                     torch.set_rng_state(cpu_rng); torch.cuda.set_rng_state(cuda_rng)
                     print(f"OOM: retrying logical batch with microbatch={micro}",flush=True)
+            # An optimizer OOM must fail, not retry after a potentially partial update.
+            norm=torch.nn.utils.clip_grad_norm_(model.parameters(),1.,error_if_nonfinite=True)
+            optimizer.step(); scheduler.step()
             record=dict(step=step+1,loss=total,gradient_norm=float(norm),microbatch=micro,
                         elapsed_seconds=time.monotonic()-start,peak_gpu_gib=torch.cuda.max_memory_allocated()/2**30)
             if (step+1)%c["eval_every"]==0 or step+1==c["steps"]:

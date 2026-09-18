@@ -10,5 +10,5 @@ echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-unset}"
 nvidia-smi
 uv run python --version
 uv --version
-echo "base_model=/root/shang/hf-modles/Qwen3.5-0.8B-Base seed=17 objective=${OBJECTIVE:-smoke}"
+echo "default_base_model=/root/shang/hf-modles/Qwen3.5-0.8B-Base default_seed=17 objective=${OBJECTIVE:-smoke}; resolved config follows in Python"
 cat configs/model.yaml

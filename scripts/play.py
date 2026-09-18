@@ -1,4 +1,5 @@
 import argparse
+import json
 from jev2048.env import Game
 from jev2048.controller import JevController
 from jev2048.trainer import require_slurm,load_checkpoint
@@ -10,6 +11,7 @@ if __name__ == "__main__":
     p.add_argument("--seed",type=int,default=9017); p.add_argument("--utility",choices=["threshold","log_tile"],default="threshold")
     p.add_argument("--threshold",type=int,default=2048); a=p.parse_args(); require_slurm(); seed_all(a.seed)
     model,saved=load_checkpoint(a.run+"/checkpoint.pt"); c=saved["config"]; del saved
+    print(json.dumps(dict(model_config=c,controller_config=vars(a)),indent=2),flush=True)
     controller=JevController(model,load_tokenizer(c["base_model"]),a.utility,a.threshold,c["max_length"])
     games=[]
     for seed in range(a.seed,a.seed+a.games):

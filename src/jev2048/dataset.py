@@ -35,6 +35,9 @@ def source_game(args):
 
 def generate(config, output):
     output = Path(output); output.mkdir(parents=True,exist_ok=True)
+    if any(output.glob("*.json*")): raise FileExistsError(f"Refusing to overwrite dataset: {output}")
+    if config["select_every"]<1 or any(n<1 for n in config["questions"].values()):
+        raise ValueError("Question counts and selection interval must be positive")
     benchmark = json.loads(Path("results/heuristic_benchmark.json").read_text())
     assert benchmark["games"] >= 100
     assert benchmark["policy_sha256"] == digest("configs/heuristic.yaml")
@@ -73,6 +76,8 @@ def mc_pair(args):
 
 def build_reference(data_dir, pairs=256, repeats=256, workers=16, seed=717):
     root = Path(data_dir)
+    if pairs<1 or repeats<2: raise ValueError("Need positive pair count and at least two MC rollouts")
+    if (root/"mc_reference.jsonl").exists(): raise FileExistsError("Reference cohort is frozen; choose a new data directory")
     manifest = json.loads((root/"manifest.json").read_text())
     assert manifest["policy_sha256"] == digest("configs/heuristic.yaml")
     assert manifest["policy_code_sha256"] == digest("src/jev2048/heuristic.py")

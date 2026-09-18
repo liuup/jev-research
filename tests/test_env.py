@@ -40,3 +40,20 @@ def test_spawn():
     g = Game(board=((2,0,0,0),)*4)
     assert g.step("RIGHT") and g.steps == 1
     assert sum(x>0 for r in g.board for x in r) == 5
+
+def test_legal_actions_and_score():
+    g=Game(board=((2,2,0,0),(0,0,0,0),(0,0,0,0),(0,0,0,0)),score=12)
+    assert g.legal_actions==["LEFT","RIGHT","DOWN"]
+    assert g.step("LEFT") and g.score==16 and g.max_tile==4
+    clone=g.clone(); clone.step(clone.legal_actions[0])
+    assert clone.steps==g.steps+1
+
+def test_spawn_distribution():
+    from collections import Counter
+    counts=Counter(); cells=Counter()
+    for seed in range(5000):
+        g=Game(seed,board=((0,)*4,)*4); g.spawn()
+        counts[g.max_tile]+=1
+        cells.update((i,j) for i in range(4) for j in range(4) if g.board[i][j])
+    assert .08<counts[4]/5000<.12
+    assert all(240<n<390 for n in cells.values())

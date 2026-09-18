@@ -62,6 +62,9 @@ sbatch --job-name=jev-paired-pg-smoke-seed17 slurm/train.sbatch paired_pg \
   --set steps=10 --set microbatch=1 --set effective_batch=16 \
   --set eval_every=5 --set eval_questions=8 --set warmup_steps=2
 
+# After that job completes successfully, audit updates and record the gate.
+uv run python scripts/verify_training_smoke.py
+
 # Once smoke is verified and main data/MC are complete:
 bash slurm/submit_all.sh
 bash slurm/status.sh

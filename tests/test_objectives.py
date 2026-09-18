@@ -36,3 +36,11 @@ def test_scores_mask_permutation():
     perm=torch.tensor([2,0,1])
     torch.testing.assert_close(masked_log_probs(z[:,perm],mask[:,perm]).exp()[:,torch.argsort(perm)],p)
     with pytest.raises(ValueError): masked_log_probs(z,torch.zeros_like(mask))
+
+def test_pg_semantic_permutation():
+    z=torch.tensor([[.2,-.3,.7]],dtype=torch.float64,requires_grad=True)
+    draws=torch.tensor([[0,2,2,1]]); y=torch.tensor([2]); perm=torch.tensor([2,0,1]); inv=perm.argsort()
+    original=paired_pg(z.log_softmax(-1),y,draws=draws)
+    permuted=paired_pg(z[:,perm].log_softmax(-1),inv[y],draws=inv[draws])
+    torch.testing.assert_close(original,permuted)
+    torch.testing.assert_close(torch.autograd.grad(original,z)[0],torch.autograd.grad(permuted,z)[0])

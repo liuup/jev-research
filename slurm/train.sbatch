@@ -10,3 +10,4 @@ export OBJECTIVE="${1:-ce}"
 source slurm/startup.sh
 shift || true
 uv run python scripts/train.py --config "configs/train_${OBJECTIVE}.yaml" "$@"
+uv run python scripts/summarize.py

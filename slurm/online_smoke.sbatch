@@ -8,4 +8,6 @@
 set -euo pipefail
 export OBJECTIVE=online_paired_pg_smoke
 source slurm/startup.sh
+uv run python scripts/smoke_test.py
 uv run python scripts/train.py --config configs/online_smoke.yaml --output runs/online_smoke "$@"
+uv run python scripts/verify_training_smoke.py --run runs/online_smoke

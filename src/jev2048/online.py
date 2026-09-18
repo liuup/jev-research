@@ -1,7 +1,11 @@
 """Fresh terminal feedback under one frozen policy per generation. No cross-policy replay."""
 
 import hashlib
+import multiprocessing as mp
+import queue
 import random
+import time
+import traceback
 from collections import deque
 
 import numpy as np
@@ -149,6 +153,104 @@ class OnlineCollector:
         rows = [self.pending.popleft() for _ in range(count)]
         validate_events(rows, self.policy.policy_id, self.generation, self.stream)
         return rows
+
+    def close(self):
+        return None
+
+
+def _prefetch_worker(policy, config, generation, stream, batch_size, output, stop):
+    try:
+        collector = OnlineCollector(policy, config, generation, stream, Game)
+        batch_index = 0
+        while not stop.is_set():
+            started = time.monotonic()
+            rows = collector.collect(batch_size)
+            message = dict(
+                batch_index=batch_index,
+                rows=rows,
+                counters=dict(collector.counters),
+                producer_seconds=time.monotonic() - started,
+            )
+            while not stop.is_set():
+                try:
+                    output.put(message, timeout=0.1)
+                    break
+                except queue.Full:
+                    continue
+            batch_index += 1
+    except BaseException:
+        message = dict(error=traceback.format_exc())
+        while not stop.is_set():
+            try:
+                output.put(message, timeout=0.1)
+                break
+            except queue.Full:
+                continue
+
+
+class AsyncOnlineCollector:
+    """Ordered bounded prefetch for a frozen CPU continuation policy."""
+
+    def __init__(
+        self, policy, config, generation, batch_size, prefetch_batches, stream="train"
+    ):
+        if policy.spec.get("kind") != "heuristic":
+            raise ValueError("Async collection currently requires a CPU heuristic policy")
+        if prefetch_batches < 1:
+            raise ValueError("prefetch_batches must be positive")
+        context = mp.get_context("spawn")
+        self.output = context.Queue(maxsize=prefetch_batches)
+        self.stop = context.Event()
+        self.process = context.Process(
+            target=_prefetch_worker,
+            args=(
+                policy,
+                config,
+                generation,
+                stream,
+                batch_size,
+                self.output,
+                self.stop,
+            ),
+            name=f"jev-prefetch-g{generation}",
+        )
+        self.policy_id = policy.policy_id
+        self.generation = generation
+        self.stream = stream
+        self.next_batch = 0
+        self.counters = dict(
+            source_games=0, behavior_steps=0, rollout_steps=0, terminal_rollouts=0
+        )
+        self.producer_seconds = 0.0
+        self.process.start()
+
+    def collect(self, count):
+        if not self.process.is_alive() and self.output.empty():
+            raise RuntimeError("Online prefetch process exited unexpectedly")
+        try:
+            message = self.output.get(timeout=300)
+        except queue.Empty as error:
+            raise RuntimeError("Timed out waiting for online feedback") from error
+        if "error" in message:
+            raise RuntimeError("Online prefetch failed:\n" + message["error"])
+        if message["batch_index"] != self.next_batch or len(message["rows"]) != count:
+            raise RuntimeError("Out-of-order or incorrectly sized prefetched batch")
+        self.next_batch += 1
+        self.counters = message["counters"]
+        self.producer_seconds = message["producer_seconds"]
+        validate_events(
+            message["rows"], self.policy_id, self.generation, self.stream
+        )
+        return message["rows"]
+
+    def close(self):
+        self.stop.set()
+        self.process.join(timeout=5)
+        if self.process.is_alive():
+            self.process.terminate()
+            self.process.join(timeout=5)
+        self.output.close()
+        self.output.join_thread()
 
 
 def retarget_questions(questions, policy_id, generation, seed, stream):

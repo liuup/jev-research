@@ -1,5 +1,7 @@
 """Policy improvement is decided by held-out games, never by training reward."""
 
+import json
+import time
 from collections import defaultdict
 
 import numpy as np
@@ -9,25 +11,57 @@ from .env import Game
 from .utils import game_summary
 
 
-def play_seeded(policy, seeds, batch_size=8, game_factory=Game):
-    finished, records = [], []
-    for offset in range(0, len(seeds), batch_size):
-        batch_seeds = seeds[offset : offset + batch_size]
-        games = [game_factory(seed) for seed in batch_seeds]
-        active = [i for i, g in enumerate(games) if not g.terminal]
-        while active:
-            actions = policy.choose_many([games[i] for i in active])
+def play_seeded(policy, seeds, batch_size=8, game_factory=Game, progress=None):
+    """Refill completed slots immediately; return results in input seed order."""
+    if batch_size < 1:
+        raise ValueError("batch_size must be positive")
+    seeds = list(seeds)
+    finished = [None] * len(seeds)
+    active = {}
+    next_index = completed = 0
+    started = last_report = time.monotonic()
+
+    def report(event):
+        if progress is not None:
+            print(json.dumps(dict(
+                event=event, **progress,
+                completed_games=completed,
+                total_games=len(seeds), active_games=len(active),
+                active_steps=[g.steps for g in active.values()],
+                elapsed_seconds=round(time.monotonic() - started, 2),
+            )), flush=True)
+
+    report("evaluation_start")
+    while next_index < len(seeds) or active:
+        previous_completed = completed
+        while len(active) < batch_size and next_index < len(seeds):
+            game = game_factory(seeds[next_index])
+            if game.terminal:
+                finished[next_index] = game
+                completed += 1
+            else:
+                active[next_index] = game
+            next_index += 1
+        if active:
+            actions = policy.choose_many(list(active.values()))
             if len(actions) != len(active):
                 raise ValueError("Wrong number of evaluation actions")
-            for index, action in zip(active, actions):
-                if not games[index].step(action):
+            for index, action in zip(list(active), actions):
+                game = active[index]
+                if not game.step(action):
                     raise ValueError("Invalid evaluation action")
-            active = [i for i in active if not games[i].terminal]
-        finished.extend(games)
-        records.extend(
-            dict(seed=seed, score=g.score, max_tile=g.max_tile, steps=g.steps)
-            for seed, g in zip(batch_seeds, games)
-        )
+                if game.terminal:
+                    finished[index] = active.pop(index)
+                    completed += 1
+        now = time.monotonic()
+        if completed != previous_completed or now - last_report >= 10:
+            report("evaluation_progress")
+            last_report = now
+    records = [
+        dict(seed=seed, score=g.score, max_tile=g.max_tile, steps=g.steps)
+        for seed, g in zip(seeds, finished)
+    ]
+    report("evaluation_complete")
     return dict(policy_id=policy.policy_id, **game_summary(finished), records=records)
 
 

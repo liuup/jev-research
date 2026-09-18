@@ -13,6 +13,7 @@ from jev2048.controller import JevController
 from jev2048.env import Game
 from jev2048.objectives import masked_log_probs
 from jev2048.online import (
+    AsyncOnlineCollector,
     OnlineCollector,
     mc_reference,
     retarget_questions,
@@ -20,11 +21,72 @@ from jev2048.online import (
     terminal_feedback,
     validate_events,
 )
-from jev2048.online_evaluation import action_ranking_metrics, promotion_decision
+from jev2048.online_evaluation import action_ranking_metrics, play_seeded, promotion_decision
 from jev2048.online_trainer import run_online, validate_online_config
 from jev2048.policies import FrozenHeuristic, FrozenModelPolicy
 from jev2048.serialization import DESCRIPTIONS
 from jev2048.verification import audit
+
+
+def test_evaluation_progress(capsys):
+    context = dict(generation=0, phase="test", role="candidate")
+    policy = FrozenHeuristic("configs/heuristic.yaml")
+    result = play_seeded(policy, [1, 2, 3], 2, tiny_game, progress=context)
+    logs = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert logs[0]["event"] == "evaluation_start"
+    assert logs[-1]["event"] == "evaluation_complete"
+    assert logs[-1]["completed_games"] == result["games"] == 3
+    assert any(row["event"] == "evaluation_progress" for row in logs)
+    assert all(row["phase"] == "test" and row["total_games"] == 3 for row in logs)
+    counts = [row["completed_games"] for row in logs]
+    assert counts == sorted(counts)
+
+
+class ScheduledGame:
+    def __init__(self, seed):
+        self.seed = seed
+        self.steps = self.score = 0
+        self.max_tile = 2
+        self.terminal = seed == 0
+
+    def step(self, action):
+        self.steps += 1
+        self.score += 4
+        self.terminal = self.steps >= self.seed
+        return True
+
+
+class RecordingPolicy:
+    policy_id = "test"
+
+    def __init__(self):
+        self.batches = []
+
+    def choose_many(self, games):
+        self.batches.append([g.seed for g in games])
+        return ["LEFT"] * len(games)
+
+
+def test_evaluation_refills_and_preserves_order():
+    policy = RecordingPolicy()
+    seeds = [1, 4, 2, 0, 1]
+    result = play_seeded(policy, seeds, 2, ScheduledGame)
+    assert policy.batches[:2] == [[1, 4], [4, 2]]
+    assert len(policy.batches) == 4
+    assert [r["seed"] for r in result["records"]] == seeds
+    assert [r["steps"] for r in result["records"]] == seeds
+    serial = play_seeded(RecordingPolicy(), seeds, 1, ScheduledGame)
+    assert result == serial
+    with pytest.raises(ValueError, match="batch_size"):
+        play_seeded(policy, seeds, 0, ScheduledGame)
+
+
+def test_evaluation_real_environment_batch_invariance():
+    policy = FrozenHeuristic("configs/heuristic.yaml")
+    seeds = list(range(12))
+    assert play_seeded(policy, seeds, 1, tiny_game) == play_seeded(
+        policy, seeds, 4, tiny_game
+    )
 
 
 def tiny_game(seed):
@@ -36,6 +98,20 @@ def tiny_game(seed):
 
 def configuration():
     return load_config("configs/model.yaml") | load_config("configs/online_smoke.yaml")
+
+
+def test_async_collector_matches_synchronous_order_and_content():
+    config = configuration()
+    policy = FrozenHeuristic(config["heuristic_config"])
+    expected_collector = OnlineCollector(policy, config, 0)
+    expected = expected_collector.collect(2)
+    collector = AsyncOnlineCollector(policy, config, 0, 2, 1)
+    try:
+        actual = collector.collect(2)
+        assert actual == expected
+        assert collector.counters == expected_collector.counters
+    finally:
+        collector.close()
 
 
 class TinyTokenizer:
@@ -167,7 +243,7 @@ def test_snapshot_is_independent_of_learner():
 
 
 def test_batched_controller_question_mapping(monkeypatch):
-    def fake_predict(model, tokenizer, rows, microbatch, max_length):
+    def fake_predict(model, tokenizer, rows, microbatch, max_length, precision="fp32"):
         p = np.zeros((len(rows), 7))
         for i, row in enumerate(rows):
             p[i, 4] = 0.9 if row["action"] == "RIGHT" else 0.1

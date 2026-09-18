@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=jev-online-train-seed17
 #SBATCH --gres=gpu:1
-#SBATCH --cpus-per-task=4
-#SBATCH --mem=48G
+#SBATCH --exclusive
+#SBATCH --cpus-per-task=24
+#SBATCH --mem=0
 #SBATCH --time=48:00:00
 #SBATCH --output=logs/slurm/%x-%j.out
 set -euo pipefail

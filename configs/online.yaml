@@ -1,9 +1,9 @@
 mode: online
 seed: 17
-generations: 3
-steps_per_generation: 100
+generations: 10
+steps_per_generation: 1000
 effective_batch: 16
-microbatch: 8
+microbatch: 16
 backbone_lr: 0.00002
 head_lr: 0.0002
 weight_decay: 0.01
@@ -16,6 +16,7 @@ initial_checkpoint: ""
 common_init: runs/common_init.pt
 heuristic_config: configs/heuristic.yaml
 source_envs: 4
+prefetch_batches: 2
 behavior_epsilon: 0.15
 select_every: 16
 inference_questions: 32

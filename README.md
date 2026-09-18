@@ -21,7 +21,7 @@ uvx ruff check src scripts tests
 uv run python scripts/validate_online.py
 ```
 
-以下是之后的 GPU 验证/训练命令；本次代码修改未提交任务。先完成两阶段 smoke 并检查成功，再启动主实验：
+以下是之后的 GPU 验证/训练命令。先完成两阶段 smoke 并检查成功，再启动主实验：
 
 ```bash
 mkdir -p logs/slurm
@@ -39,7 +39,7 @@ bash slurm/status.sh
 # bash slurm/cancel.sh JOB_ID [JOB_ID ...]
 ```
 
-配置位于 `configs/online.yaml`，默认 3 代、每代 100 步、microbatch 8、有效 batch 16、BF16、梯度检查点、AdamW。支持 `--set generations=2 --set steps_per_generation=20`。不依赖旧 `common_init.pt`；从本地 base 和 seed 初始化，也可指定 `initial_checkpoint`。三个目标初始权重与随机种子相同，但在线策略分化后采样轨迹会不同，比较时也需看环境交互量和耗时。
+配置位于 `configs/online.yaml`, 从本地 base 和 seed 初始化，也可指定 `initial_checkpoint`。三个目标初始权重与随机种子相同，但在线策略分化后采样轨迹会不同，比较时也需看环境交互量和耗时。
 
 ## 结果与评估
 
@@ -59,3 +59,7 @@ uv run python scripts/summarize.py
 ```
 
 汇总输出为 `results/comparison.{csv,json,md}`，概率指标与闭环得分分表保存。训练、holdout、MC、晋升和测试使用隔离随机流；holdout 棋盘固定，MC 标签只用于评估。
+
+新实验默认 FP32 推理（禁用 TF32），训练仍用 BF16。候选策略将 `inference_precision` 写入快照身份；旧快照缺少该字段时仍按原来的 BF16 恢复，避免改变冻结策略。概率评估默认 FP32，因此重评旧模型可能与历史 BF16 指标略有差异。FP32 降低但不保证消除所有数值差异，且可能增加推理耗时和显存。
+
+启发式 continuation 阶段使用一个有界后台进程预取终局反馈；batch 顺序、种子和策略版本保持固定。若神经策略晋升，单 GPU 下自动回退同步采样，避免推理与训练争用 GPU。训练 Slurm 作业独占本机节点资源。

@@ -1,4 +1,5 @@
 import argparse
+import hashlib
 import json
 import time
 from pathlib import Path
@@ -18,6 +19,7 @@ if __name__ == "__main__":
     p.add_argument("--utility", choices=["threshold", "log_tile"], default="threshold")
     p.add_argument("--threshold", type=int, default=2048)
     p.add_argument("--policy", choices=["active", "candidate"], default="active")
+    p.add_argument("--inference-precision", choices=["fp32", "bf16"], default=None)
     a = p.parse_args()
     if a.games < 1:
         p.error("--games must be positive")
@@ -25,6 +27,8 @@ if __name__ == "__main__":
     output = Path(a.run) / (
         f"controller_{a.policy}.json" if online else f"controller_{a.utility}.json"
     )
+    if a.inference_precision:
+        output = output.with_name(f"{output.stem}_{a.inference_precision}.json")
     game_log = output.with_suffix(".jsonl")
     if output.exists() or game_log.exists():
         raise FileExistsError(f"Evaluation output already exists: {output}")
@@ -35,6 +39,11 @@ if __name__ == "__main__":
         if not spec_path.exists():
             raise ValueError("Candidate evaluation requires a generation directory")
         spec = json.loads(spec_path.read_text())
+        if spec["kind"] == "jev" and a.inference_precision:
+            spec["inference_precision"] = a.inference_precision
+            spec["policy_id"] = "jev-eval:" + hashlib.sha256(
+                json.dumps(spec, sort_keys=True).encode()
+            ).hexdigest()
         metadata_path = Path(a.run) / "resolved_config.json"
         if not metadata_path.exists():
             metadata_path = Path(a.run).parent / "resolved_config.json"
@@ -50,6 +59,7 @@ if __name__ == "__main__":
             a.utility,
             a.threshold,
             c["max_length"],
+            inference_precision=a.inference_precision or "fp32",
         )
     print(
         json.dumps(dict(model_config=c, controller_config=vars(a)), indent=2),
@@ -82,6 +92,7 @@ if __name__ == "__main__":
         utility=spec.get("utility", "heuristic") if online else a.utility,
         threshold=spec.get("threshold") if online else a.threshold,
         policy_id=spec["policy_id"] if online else "legacy_checkpoint",
+        inference_precision=spec.get("inference_precision", "bf16") if online and spec["kind"] == "jev" else (a.inference_precision or "fp32") if not online else None,
         total_seconds=total_seconds,
         mean_game_seconds=total_seconds / len(games),
         seconds_per_step=total_seconds / sum(g.steps for g in games),

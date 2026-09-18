@@ -45,6 +45,7 @@ class FrozenModelPolicy:
             spec["threshold"],
             config["max_length"],
             config["inference_questions"],
+            spec.get("inference_precision", "bf16"),
         )
 
     def choose_many(self, games):
@@ -64,7 +65,12 @@ def snapshot_candidate(model, tokenizer, checkpoint_path, config, target_policy_
         prediction_policy_id=target_policy_id,
         utility=config["utility"],
         threshold=config["threshold"],
+        inference_precision=config.get("inference_precision", "fp32"),
     )
+    # Precision changes the physical action policy; include it in snapshot identity.
+    spec["policy_id"] = "jev:" + hashlib.sha256(
+        json.dumps(spec, sort_keys=True).encode()
+    ).hexdigest()
     return FrozenModelPolicy(copy.deepcopy(model), tokenizer, spec, config)
 
 

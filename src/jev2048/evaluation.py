@@ -1,6 +1,7 @@
 """Observed-event metrics and separate evaluation-only MC comparisons."""
 
 from pathlib import Path
+from contextlib import contextmanager
 
 import numpy as np
 import torch
@@ -11,18 +12,38 @@ from .dataset import collate
 from .serialization import OUTCOMES
 
 
+@contextmanager
+def inference_precision(precision):
+    if precision not in ("fp32", "bf16"):
+        raise ValueError("inference precision must be fp32 or bf16")
+    matmul = torch.backends.cuda.matmul.allow_tf32
+    cudnn = torch.backends.cudnn.allow_tf32
+    try:
+        if precision == "fp32":
+            torch.backends.cuda.matmul.allow_tf32 = False
+            torch.backends.cudnn.allow_tf32 = False
+        yield
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = matmul
+        torch.backends.cudnn.allow_tf32 = cudnn
+
+
 @torch.no_grad()
-def predict(model, tokenizer, rows, microbatch=2, max_length=512):
+def predict(model, tokenizer, rows, microbatch=2, max_length=512, precision="fp32"):
     model.eval()
     device = next(model.parameters()).device
     predictions = []
-    for i in range(0, len(rows), microbatch):
-        batch = collate(rows[i : i + microbatch], tokenizer, max_length)
-        with torch.autocast(
-            device.type, dtype=torch.bfloat16, enabled=device.type == "cuda"
-        ):
-            lp = model(batch)
-        predictions.extend(lp.exp().cpu().tolist())
+    if precision == "fp32" and any(p.is_floating_point() and p.dtype != torch.float32 for p in model.parameters()):
+        raise ValueError("FP32 inference requires FP32 model parameters")
+    with inference_precision(precision):
+        for i in range(0, len(rows), microbatch):
+            batch = collate(rows[i : i + microbatch], tokenizer, max_length)
+            with torch.autocast(
+                device.type, dtype=torch.bfloat16,
+                enabled=device.type == "cuda" and precision == "bf16",
+            ):
+                lp = model(batch)
+            predictions.extend(lp.exp().cpu().tolist())
     return np.array(predictions)
 
 

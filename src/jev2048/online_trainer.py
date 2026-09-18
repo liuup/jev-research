@@ -1,4 +1,4 @@
-"""Synchronous online generalized policy iteration with versioned terminal feedback."""
+"""Online generalized policy iteration with versioned terminal feedback."""
 
 import copy
 import json
@@ -14,6 +14,7 @@ from .env import Game
 from .evaluation import mc_metrics, observed_metrics, plot_reliability, predict
 from .model import JevModel, load_tokenizer
 from .online import (
+    AsyncOnlineCollector,
     OnlineCollector,
     mc_reference,
     retarget_questions,
@@ -47,6 +48,8 @@ def validate_online_config(c):
     ):
         if not isinstance(c[key], int) or c[key] < 1:
             raise ValueError(f"{key} must be a positive integer")
+    if not isinstance(c["prefetch_batches"], int) or c["prefetch_batches"] < 0:
+        raise ValueError("prefetch_batches must be a nonnegative integer")
     if c["microbatch"] > c["effective_batch"] or c["effective_batch"] % c["microbatch"]:
         raise ValueError("Microbatch must divide effective_batch")
     if c["mc_rollouts"] < 2 or c["reward_samples"] < 2:
@@ -178,7 +181,34 @@ def run_online(
             folder.mkdir()
             target_spec = copy.deepcopy(incumbent.spec)
             save_json(folder / "target_policy.json", target_spec)
-            collector = OnlineCollector(incumbent, c, generation, "train", game_factory)
+            async_collection = (
+                c["prefetch_batches"] > 0
+                and incumbent.spec.get("kind") == "heuristic"
+                and game_factory is Game
+                and device.type == "cuda"
+            )
+            collector = (
+                AsyncOnlineCollector(
+                    incumbent,
+                    c,
+                    generation,
+                    c["effective_batch"],
+                    c["prefetch_batches"],
+                )
+                if async_collection
+                else OnlineCollector(incumbent, c, generation, "train", game_factory)
+            )
+            print(
+                json.dumps(
+                    dict(
+                        event="collector_start",
+                        generation=generation,
+                        mode="async_process" if async_collection else "synchronous",
+                        prefetch_batches=c["prefetch_batches"] if async_collection else 0,
+                    )
+                ),
+                flush=True,
+            )
             validation, initial_metrics = probability_evaluation(
                 model, tokenizer, c, questions, incumbent, generation, folder
             )
@@ -206,7 +236,9 @@ def run_online(
             if device.type == "cuda":
                 torch.cuda.reset_peak_memory_stats()
             train_start = time.monotonic()
-            with (folder / "events.jsonl").open("w") as events_file:
+            events_file = None
+            try:
+                events_file = (folder / "events.jsonl").open("w")
                 for local_step in range(c["steps_per_generation"]):
                     collect_start = time.monotonic()
                     rows = collector.collect(c["effective_batch"])
@@ -224,6 +256,9 @@ def run_online(
                         generation=generation,
                         generation_step=local_step + 1,
                         collection_seconds=collect_seconds,
+                        producer_collection_seconds=getattr(
+                            collector, "producer_seconds", collect_seconds
+                        ),
                         online_questions_per_second=len(rows)
                         / (collect_seconds + record["step_seconds"]),
                         environment=dict(collector.counters),
@@ -255,6 +290,10 @@ def run_online(
                     log.write(json.dumps(record) + "\n")
                     log.flush()
                     print(json.dumps(record), flush=True)
+            finally:
+                collector.close()
+                if events_file is not None:
+                    events_file.close()
             training_stats = dict(
                 training_seconds=time.monotonic() - train_start,
                 actual_microbatch=micro,
@@ -317,10 +356,12 @@ def run_online(
                 for i in range(c["promotion_games"])
             ]
             old_games = play_seeded(
-                incumbent, promotion_seeds, c["game_batch"], game_factory
+                incumbent, promotion_seeds, c["game_batch"], game_factory,
+                progress=dict(generation=generation, phase="promotion", role="incumbent"),
             )
             new_games = play_seeded(
-                candidate, promotion_seeds, c["game_batch"], game_factory
+                candidate, promotion_seeds, c["game_batch"], game_factory,
+                progress=dict(generation=generation, phase="promotion", role="candidate"),
             )
             decision = promotion_decision(old_games, new_games, c["promotion_margin"])
             save_json(
@@ -331,8 +372,14 @@ def run_online(
             test_seeds = [
                 stream_seed(c["seed"], "test_games", i) for i in range(c["test_games"])
             ]
-            test_old = play_seeded(incumbent, test_seeds, c["game_batch"], game_factory)
-            test_new = play_seeded(candidate, test_seeds, c["game_batch"], game_factory)
+            test_old = play_seeded(
+                incumbent, test_seeds, c["game_batch"], game_factory,
+                progress=dict(generation=generation, phase="test", role="incumbent"),
+            )
+            test_new = play_seeded(
+                candidate, test_seeds, c["game_batch"], game_factory,
+                progress=dict(generation=generation, phase="test", role="candidate"),
+            )
             save_json(
                 folder / "controller_test.json",
                 dict(

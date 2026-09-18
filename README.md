@@ -8,7 +8,7 @@
 
 - 训练只使用模拟器生成的单次观测结果 `Y`；MC 概率仅用于评估。按来源轨迹划分数据，生成后不得调整冻结策略。
 - 比较 CE、直接 Brier 和 paired-PG。PG 从结果分布抽样 32 次，使用 detached 条件基线，期望奖励为 `2 pᵀq - ||p||²`。实现见 [objectives.py](src/jev2048/objectives.py)；它是 RLCD-inspired 方法，不是官方 TypeSafe RLCD 算法。
-- 三种目标共享初始化、数据及优化设置。默认 500 步、microbatch 4、梯度累积 4、有效 batch 16，使用 BF16、梯度检查点和 AdamW。配置见 `configs/`，支持 `--set key=value`。
+- 三种目标共享初始化、数据及优化设置。默认 500 步、microbatch 8、梯度累积 2、有效 batch 16，使用 BF16、梯度检查点和 AdamW。Slurm 短测中 microbatch 8/16 分别约 1.71/2.09 秒每步，因此采用 8。配置见 `configs/`，支持 `--set key=value`。
 - 动作概率不等于结果概率，准确率不等于校准。闭环控制器表现单独报告。直接 Brier 可能因方差更低而优于 PG；单 seed 和有限 MC 样本不足以证明优越性。
 
 ## 安装与验证
@@ -58,7 +58,7 @@ bash slurm/submit_all.sh
 
 ```bash
 bash slurm/status.sh
-tail -f logs/slurm/jev-paired_pg-mb4-seed17-29.out  # 当前主实验
+tail -f logs/slurm/jev-paired_pg-mb8-seed17-JOB_ID.out  # 替换为提交返回的 ID
 # bash slurm/cancel.sh JOB_ID [JOB_ID ...]      # 显式指定要取消的作业
 
 # 训练结束后；训练脚本也会自动执行最终概率评估

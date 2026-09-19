@@ -22,7 +22,7 @@ source_envs: 8
 prefetch_batches: 4
 behavior_epsilon: 0.15
 select_every: 16
-inference_questions: 64
+inference_questions: 16
 validation_questions: 256
 mc_states: 4
 mc_rollouts: 16

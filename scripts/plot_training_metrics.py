@@ -61,7 +61,7 @@ def metric(row, split, key):
     return row[split][key]
 
 
-def plot_metrics(records, output, smooth, title):
+def plot_metrics(records, output, smooth, title, phase_boundaries=()):
     steps = np.array([row["step"] for row in records])
     generations = np.array([row.get("generation", 0) for row in records])
     definitions = (
@@ -103,6 +103,9 @@ def plot_metrics(records, output, smooth, title):
     for index in np.flatnonzero(generations[1:] != generations[:-1]) + 1:
         for axis in axes:
             axis.axvline(steps[index], color="black", linestyle="--", alpha=0.35)
+    for boundary in phase_boundaries:
+        for axis in axes:
+            axis.axvline(boundary, color="black", linestyle=":", alpha=0.5)
     axes[-1].set_xlabel("Optimizer step")
     figure.suptitle(f"{title} ({len(records):,} completed steps)")
     figure.tight_layout()
@@ -130,13 +133,26 @@ def main():
         if args.output
         else Path("results/plots") / f"{run.name}_nll_brier.png"
     )
-    records = read_records(run / "training.jsonl")
     metadata = json.loads((run / "resolved_config.json").read_text())
     config = metadata["config"]
+    records = read_records(run / "training.jsonl")
+    phase_boundaries = []
+    continuation_from = config.get("continuation_from")
+    if continuation_from:
+        parent = Path(continuation_from).parent
+        parent_records = read_records(parent / "training.jsonl")
+        phase_boundaries.append(metadata["global_step_offset"])
+        records = list(
+            {
+                row["step"]: row
+                for row in parent_records + records
+            }.values()
+        )
+        records.sort(key=lambda row: row["step"])
     objective = config["objective"].replace("_", "-")
     mode = config.get("mode", "training").title()
     title = args.title or f"{mode} {objective} probability metrics"
-    plot_metrics(records, output, args.smooth, title)
+    plot_metrics(records, output, args.smooth, title, phase_boundaries)
     print(json.dumps(dict(output=str(output), steps=len(records), smooth=args.smooth)))
 
 

@@ -1,21 +1,38 @@
+#!/usr/bin/env python3
+"""Evaluate a saved Snake checkpoint on a frozen seed cohort."""
+
 import argparse
 import json
-from pathlib import Path
 
-from jev2048.model import load_tokenizer
-from jev2048.online_trainer import reevaluate_online
-from jev2048.trainer import evaluate_run, load_checkpoint, require_slurm
+from jevsnake.evaluation import play_seeded
+from jevsnake.model import load_tokenizer
+from jevsnake.policies import FrozenModelPolicy
+from jevsnake.runtime import load_checkpoint, require_slurm
+from jevsnake.utils import digest, save_json, stream_seed
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("checkpoint")
+    parser.add_argument("--output", required=True)
+    parser.add_argument("--games", type=int)
+    args = parser.parse_args()
+    require_slurm()
+    model, saved = load_checkpoint(args.checkpoint)
+    config = saved["config"]
+    tokenizer = load_tokenizer(config["base_model"])
+    spec = {
+        "kind": "jev_snake_evaluation",
+        "policy_id": "jev-snake-eval:" + digest(args.checkpoint),
+        "checkpoint": args.checkpoint,
+    }
+    policy = FrozenModelPolicy(model, tokenizer, spec, config)
+    count = args.games or config["test_games"]
+    seeds = [stream_seed(config["seed"], "standalone-test", i) for i in range(count)]
+    result = play_seeded(policy, seeds, config)
+    save_json(args.output, result)
+    print(json.dumps({key: value for key, value in result.items() if key != "records"}))
+
 
 if __name__ == "__main__":
-    p = argparse.ArgumentParser()
-    p.add_argument("--run", required=True)
-    a = p.parse_args()
-    require_slurm()
-    if (Path(a.run) / "target_policy.json").exists():
-        print(json.dumps(reevaluate_online(a.run), indent=2))
-        raise SystemExit(0)
-    m, s = load_checkpoint(a.run + "/checkpoint.pt")
-    c = s["config"]
-    del s
-    print(json.dumps(c, indent=2), flush=True)
-    evaluate_run(m, load_tokenizer(c["base_model"]), c, a.run)
+    main()

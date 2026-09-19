@@ -1,87 +1,75 @@
-from collections import Counter
+import copy
+import unittest
 
-import pytest
-
-from jev2048.env import ACTIONS, Game, merge, moved
-from jev2048.heuristic import HeuristicPolicy
+from jevsnake.env import SnakeGame
 
 
-@pytest.mark.parametrize(
-    "row,out,score",
-    [
-        ([2, 2, 2, 2], [4, 4, 0, 0], 8),
-        ([4, 4, 8, 8], [8, 16, 0, 0], 24),
-        ([2, 2, 4, 0], [4, 4, 0, 0], 4),
-        ([4, 0, 4, 4], [8, 4, 0, 0], 8),
-        ([0, 0, 0, 0], [0, 0, 0, 0], 0),
-        ([2, 4, 8, 16], [2, 4, 8, 16], 0),
-        ([2, 2, 4, 4], [4, 8, 0, 0], 12),
-        ([2, 0, 0, 2], [4, 0, 0, 0], 4),
-    ],
-)
-def test_merge(row, out, score):
-    assert merge(tuple(row)) == (tuple(out), score)
+def state(game, **changes):
+    value = game.full_state()
+    value.update(changes)
+    return value
 
 
-@pytest.mark.parametrize("action", ACTIONS)
-def test_directions(action):
-    board = ((2, 2, 0, 0),) * 4
-    b, s = moved(board, action)
-    assert s == 16
-    assert sum(map(sum, b)) == sum(map(sum, board))
-    if action == "LEFT":
-        assert b[0] == (4, 0, 0, 0)
-    if action == "RIGHT":
-        assert b[0] == (0, 0, 0, 4)
-    if action == "UP":
-        assert b[0] == (4, 4, 0, 0) and b[3] == (0, 0, 0, 0)
-    if action == "DOWN":
-        assert b[3] == (4, 4, 0, 0) and b[0] == (0, 0, 0, 0)
+class SnakeEnvironmentTests(unittest.TestCase):
+    def test_seeded_food_stream_and_clone_are_reproducible(self):
+        first = SnakeGame(25, 8, 3)
+        second = SnakeGame(25, 8, 3)
+        self.assertEqual(first.full_state(), second.full_state())
+        clone = first.clone()
+        transition = clone.step("north")
+        self.assertFalse(transition["collision"])
+        self.assertEqual((first.steps, clone.steps), (0, 1))
 
+    def test_reverse_excluded_but_collisions_remain_candidates(self):
+        game = SnakeGame.from_state(
+            state(
+                SnakeGame(25, 4, 3),
+                body=[[0, 2], [0, 1], [0, 0]],
+                direction="east",
+                food=[3, 3],
+            )
+        )
+        self.assertEqual(game.legal_actions, ["north", "east", "south"])
+        self.assertFalse(game.one_step_safe("north"))
+        transition = game.step("north")
+        self.assertTrue(transition["collision"])
+        self.assertEqual(game.outcome, "wall_collision")
 
-def test_seed_clone_invalid_terminal():
-    a, b = Game(17), Game(17)
-    p = HeuristicPolicy()
-    for _ in range(30):
-        assert a.state() == b.state()
-        assert p.choose(a) == p.choose(b)
-        c = a.clone()
-        action = p.choose(a)
-        a.step(action)
-        b.step(action)
-        c.step(action)
-        assert a.state() == c.state()
-    full = Game(board=((2, 4, 2, 4), (4, 2, 4, 2), (2, 4, 2, 4), (4, 2, 4, 2)))
-    before = full.clone()
-    assert full.terminal and full.legal_actions == []
-    assert not full.step("LEFT")
-    assert (
-        full.state() == before.state() and full.rng.getstate() == before.rng.getstate()
-    )
+    def test_vacated_tail_is_legal_unless_move_grows(self):
+        game = SnakeGame.from_state(
+            state(
+                SnakeGame(25, 3, 2),
+                body=[[1, 1], [1, 0], [0, 0], [0, 1]],
+                direction="east",
+                food=[2, 2],
+            )
+        )
+        self.assertEqual(game.destination("north"), (0, 1))
+        self.assertTrue(game.one_step_safe("north"))
+        game.step("north")
+        self.assertEqual(game.body[0], (0, 1))
+        self.assertFalse(game.terminal)
 
+    def test_food_growth_and_full_board_win(self):
+        game = SnakeGame.from_state(
+            state(
+                SnakeGame(25, 2, 1),
+                body=[[0, 0], [1, 0], [1, 1]],
+                direction="north",
+                food=[0, 1],
+            )
+        )
+        result = game.step("east")
+        self.assertEqual(result, {"ate_food": True, "collision": False, "win": True})
+        self.assertEqual(game.score, 1)
+        self.assertTrue(game.terminal)
+        self.assertIsNone(game.food)
 
-def test_spawn():
-    g = Game(board=((2, 0, 0, 0),) * 4)
-    assert g.step("RIGHT") and g.steps == 1
-    assert sum(x > 0 for r in g.board for x in r) == 5
-
-
-def test_legal_actions_and_score():
-    g = Game(board=((2, 2, 0, 0), (0, 0, 0, 0), (0, 0, 0, 0), (0, 0, 0, 0)), score=12)
-    assert g.legal_actions == ["LEFT", "RIGHT", "DOWN"]
-    assert g.step("LEFT") and g.score == 16 and g.max_tile == 4
-    clone = g.clone()
-    clone.step(clone.legal_actions[0])
-    assert clone.steps == g.steps + 1
-
-
-def test_spawn_distribution():
-    counts = Counter()
-    cells = Counter()
-    for seed in range(5000):
-        g = Game(seed, board=((0,) * 4,) * 4)
-        g.spawn()
-        counts[g.max_tile] += 1
-        cells.update((i, j) for i in range(4) for j in range(4) if g.board[i][j])
-    assert 0.08 < counts[4] / 5000 < 0.12
-    assert all(240 < n < 390 for n in cells.values())
+    def test_step_rejects_reverse_and_does_not_hide_invalid_state(self):
+        game = SnakeGame(25, 8, 3)
+        with self.assertRaises(ValueError):
+            game.step("west")
+        broken = copy.deepcopy(game.full_state())
+        broken["body"][1] = broken["body"][0]
+        with self.assertRaises(ValueError):
+            SnakeGame.from_state(broken)

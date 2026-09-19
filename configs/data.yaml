@@ -1,8 +1,0 @@
-seed: 25
-questions: {train: 50000, dev: 512, calibration: 512, test: 512}
-split_seeds: {train: 25000000, dev: 35000000, calibration: 45000000, test: 55000000}
-random_action_probability: 0.15
-select_every: 20
-workers: 16
-reference_pairs: 256
-reference_rollouts: 256

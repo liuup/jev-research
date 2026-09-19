@@ -1,36 +1,42 @@
+inherit: model.yaml
 mode: online
-seed: 25
-max_policy_generations: 2
-min_optimizer_steps_per_policy: 500
-max_optimizer_steps_per_policy: 1000
-promotion_interval_steps: 250
-max_total_optimizer_steps: 2000
-# H100 NVL 96 GB benchmark: microbatch 256 used 63.7 GiB allocated / 72.2 GiB reserved.
+objective: paired_pg
+
+board_size: 8
+initial_length: 3
+event_horizon: 16
+episode_horizon: 256
+outcomes: [collision, timeout, food]
+utilities: [-1.0, 0.0, 1.0]
+
+max_policy_generations: 3
+min_optimizer_steps_per_policy: 1000
+max_optimizer_steps_per_policy: 5000
+promotion_interval_steps: 1000
+max_total_optimizer_steps: 15000
+
+source_envs: 64
+behavior_epsilon: 0.20
+select_every: 1
 effective_batch: 256
 microbatch: 256
+
 backbone_lr: 0.00002
 head_lr: 0.0002
 weight_decay: 0.01
-warmup_steps: 20
-eval_every: 50
+warmup_steps: 50
+eval_every: 100
 reward_samples: 32
 baseline: conditional
-# Empty means fresh local pretrained text weights plus a seeded random decision head.
-initial_checkpoint: ""
-common_init: runs/common_init.pt
-heuristic_config: configs/heuristic.yaml
-source_envs: 16
-prefetch_batches: 4
-behavior_epsilon: 0.15
-select_every: 16
+
 inference_questions: 256
-validation_questions: 256
-mc_states: 4
-mc_rollouts: 16
-promotion_games: 64
-test_games: 32
-game_batch: 64
-promotion_min_log_tile_gain: 0.10
-utility: log_tile
-threshold: 2048
+validation_events: 1024
+mc_states: 32
+mc_rollouts: 32
+promotion_games: 128
+test_games: 256
+game_batch: 128
+promotion_min_food_gain: 0.0
+promotion_z: 1.645
 save_optimizer: true
+initial_checkpoint: ""

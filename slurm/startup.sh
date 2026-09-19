@@ -20,11 +20,10 @@ if [[ -n "$git_ref" && -f ".git/$git_ref" ]]; then
 else
     git_head=$(<.git/HEAD)
 fi
-echo "git_head=$git_head"
 export JEV_GIT_COMMIT="$git_head"
+echo "git_head=$git_head"
 echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-unset}"
 nvidia-smi
 python --version
 echo "conda_env=$CONDA_DEFAULT_ENV python=$(command -v python)"
-echo "default_base_model=/work/s0liu022/hf-models/Qwen3.5-0.8B default_seed=25 objective=${OBJECTIVE:-smoke}; resolved config follows in Python"
-cat configs/model.yaml
+echo "task=online_snake default_seed=25 objective=${OBJECTIVE:-unset}"

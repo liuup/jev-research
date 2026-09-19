@@ -2,6 +2,11 @@ __pycache__/
 .pytest_cache/
 data/
 runs/
-logs/
 results/
 *.egg-info/
+
+# Slurm opens its output path before the job script starts.
+logs/*
+!logs/slurm/
+logs/slurm/*
+!logs/slurm/.gitkeep

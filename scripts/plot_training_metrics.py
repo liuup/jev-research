@@ -7,6 +7,8 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 
+from jev2048.serialization import OUTCOMES
+
 
 def read_records(path):
     records = []
@@ -34,17 +36,42 @@ def moving_average(values, window):
     return result
 
 
+def mean_log_tile_bias(row, split):
+    metrics = row[split]
+    if "expected_log_tile_mean_bias" in metrics:
+        return metrics["expected_log_tile_mean_bias"]
+    if split == "dev":
+        return (
+            metrics["predicted_expected_log_tile"]
+            - metrics["observed_mean_log_tile"]
+        )
+    utilities = np.arange(7, 14, dtype=float)
+    predicted = np.array(
+        [row["mean_predicted_distribution"][outcome] for outcome in OUTCOMES]
+    )
+    counts = np.array(
+        [row["observed_outcome_counts"][outcome] for outcome in OUTCOMES]
+    )
+    return float(predicted @ utilities - counts @ utilities / counts.sum())
+
+
+def metric(row, split, key):
+    if key == "expected_log_tile_mean_bias":
+        return mean_log_tile_bias(row, split)
+    return row[split][key]
+
+
 def plot_metrics(records, output, smooth):
     steps = np.array([row["step"] for row in records])
     generations = np.array([row["generation"] for row in records])
     definitions = (
         ("observed_nll", "Observed NLL"),
         ("observed_brier", "Vector Brier score"),
-        ("observed_log_tile_mae", "Observed log-tile MAE"),
+        ("expected_log_tile_mean_bias", "Mean expected log-tile bias"),
     )
     figure, axes = plt.subplots(3, 1, figsize=(11, 10), sharex=True)
     for axis, (key, label) in zip(axes, definitions):
-        train = np.array([row["train"][key] for row in records])
+        train = np.array([metric(row, "train", key) for row in records])
         axis.plot(steps, train, color="#4C78A8", alpha=0.18, linewidth=0.8, label="train batch")
         axis.plot(
             steps,
@@ -53,7 +80,11 @@ def plot_metrics(records, output, smooth):
             linewidth=2,
             label=f"train rolling mean ({smooth})",
         )
-        dev = [(row["step"], row["dev"][key]) for row in records if "dev" in row]
+        dev = [
+            (row["step"], metric(row, "dev", key))
+            for row in records
+            if "dev" in row
+        ]
         if dev:
             axis.plot(
                 [item[0] for item in dev],
@@ -65,6 +96,8 @@ def plot_metrics(records, output, smooth):
                 label="dev",
             )
         axis.set_ylabel(label)
+        if key == "expected_log_tile_mean_bias":
+            axis.axhline(0, color="black", linestyle="--", alpha=0.5)
         axis.grid(alpha=0.25)
         axis.legend()
     for index in np.flatnonzero(generations[1:] != generations[:-1]) + 1:

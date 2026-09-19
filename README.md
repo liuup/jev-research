@@ -51,7 +51,7 @@ bash slurm/status.sh
 
 `runs/online_paired_pg_seed17/`：
 
-- `training.jsonl`：reward、优势统计、NLL/Brier、expected log-tile 误差、预测分布及环境交互量；不记录显存。
+- `training.jsonl`：reward、优势统计、NLL/Brier、预测/观测平均 log-tile 及其总体偏差、预测分布和环境交互量；不记录显存。单次随机终局不能提供真实 expected log-tile，因此不报告会误导的逐样本 MAE。
 - `generation_XXX/events.jsonl`：本代实际用于更新的单次环境反馈，作为审计记录，不是预生成训练集。
 - `generation_XXX/checkpoint.pt`：最后一次晋升检查使用的学习器权重；其预测目标由 `target_policy.json` 指定。
 - `generation_XXX/metrics.json`：固定 holdout 棋盘上的概率指标、MC 动作排序一致率和效用 regret。每代按对应冻结策略重采标签与 MC 概率。
@@ -65,3 +65,5 @@ uv run python scripts/summarize.py
 ```
 
 汇总输出为 `results/comparison.{csv,json,md}`，概率指标与闭环得分分表保存。训练、holdout、MC、晋升和测试使用隔离随机流；holdout 棋盘固定，MC 标签只用于评估。
+
+单次观测标签上的正式概率指标是 NLL/Brier。Expected log-tile 误差仅在 MC reference 上比较 `pᵀu` 与 `q_hatᵀu`；控制能力则使用配对种子闭环游戏的平均终局 log-tile。总体均值偏差只检查系统性高估/低估，不能衡量逐状态期望误差。

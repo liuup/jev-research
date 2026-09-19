@@ -48,11 +48,6 @@ def optimization_step(model, tok, batch_rows, optimizer, scheduler, c, micro):
                 with torch.no_grad():
                     p = lp.detach().exp()
                     py = p.gather(1, targets[:, None]).squeeze(1)
-                    log_tile_utility = torch.arange(
-                        7, 7 + p.shape[1], device=device, dtype=p.dtype
-                    )
-                    predicted_log_tile = p @ log_tile_utility
-                    observed_log_tile = log_tile_utility[targets]
                     diagnostics.update(
                         observed_nll=-lp.detach().gather(1, targets[:, None]).mean(),
                         observed_brier=(p.square().sum(1) - 2 * py + 1).mean(),
@@ -63,16 +58,6 @@ def optimization_step(model, tok, batch_rows, optimizer, scheduler, c, micro):
                         .mean(),
                         top1_accuracy=(p.argmax(1) == targets).float().mean(),
                         max_probability=p.max(1).values.mean(),
-                        observed_log_tile_mae=(
-                            predicted_log_tile - observed_log_tile
-                        )
-                        .abs()
-                        .mean(),
-                        observed_log_tile_mse=(
-                            predicted_log_tile - observed_log_tile
-                        )
-                        .square()
-                        .mean(),
                     )
                     for key, value in diagnostics.items():
                         metrics[key] = metrics.get(key, 0) + value.detach() * len(
@@ -108,6 +93,25 @@ def optimization_step(model, tok, batch_rows, optimizer, scheduler, c, micro):
     optimizer.step()
     scheduler.step()
     metrics = {key: float(value) for key, value in metrics.items()}
+    log_tile_utility = torch.arange(
+        7,
+        7 + len(OUTCOME_IDS),
+        device=device,
+        dtype=predicted_mass.dtype,
+    )
+    predicted_mean_log_tile = float(
+        predicted_mass.dot(log_tile_utility) / len(batch_rows)
+    )
+    observed_mean_log_tile = float(
+        observed_counts.dot(log_tile_utility) / len(batch_rows)
+    )
+    mean_log_tile_bias = predicted_mean_log_tile - observed_mean_log_tile
+    metrics.update(
+        predicted_expected_log_tile=predicted_mean_log_tile,
+        observed_mean_log_tile=observed_mean_log_tile,
+        expected_log_tile_mean_bias=mean_log_tile_bias,
+        expected_log_tile_mean_absolute_bias=abs(mean_log_tile_bias),
+    )
     if "advantage_second_moment" in metrics:
         metrics["advantage_std"] = (
             max(

@@ -51,7 +51,7 @@ Configuration is stored in `configs/online.yaml`. Training initializes from the 
 
 Under `runs/online_paired_pg_seed17/`:
 
-- `training.jsonl`: reward, advantage statistics, NLL/Brier, expected-log-tile errors, predicted distributions, and environment interaction counts; GPU memory is not recorded here.
+- `training.jsonl`: reward, advantage statistics, NLL/Brier, predicted and observed mean log-tile and their aggregate bias, predicted distributions, and environment interaction counts; GPU memory is not recorded here. A single stochastic terminal event does not reveal the true expected log-tile, so misleading per-example MAE is not reported.
 - `generation_XXX/events.jsonl`: the single-outcome environment feedback actually consumed for updates in that generation. This is an audit log, not a pre-generated training dataset.
 - `generation_XXX/checkpoint.pt`: learner weights used by the latest promotion check. Its prediction target is specified by `target_policy.json`.
 - `generation_XXX/metrics.json`: probability metrics, Monte Carlo action-ranking agreement, and utility regret on fixed holdout boards. Labels and MC probabilities are regenerated each generation under that generation's frozen policy.
@@ -65,3 +65,5 @@ uv run python scripts/summarize.py
 ```
 
 Summary outputs are written to `results/comparison.{csv,json,md}`, with probability metrics and closed-loop scores kept in separate tables. Training, holdout, MC, promotion, and test data use isolated random streams. Holdout boards remain fixed, and MC labels are used for evaluation only.
+
+NLL and Brier are the formal probability metrics for single observed outcomes. Expected-log-tile error is evaluated only on the MC reference by comparing `pᵀu` with `q_hatᵀu`; control quality uses paired-seed closed-loop mean terminal log-tile. Aggregate mean bias diagnoses systematic over- or under-prediction but is not a per-state expected-utility error.

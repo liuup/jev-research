@@ -17,7 +17,8 @@ FIELDS = [
     "observed_brier",
     "predicted_expected_log_tile",
     "observed_mean_log_tile",
-    "observed_log_tile_mae",
+    "expected_log_tile_mean_bias",
+    "expected_log_tile_mean_absolute_bias",
     "mc_squared_l2",
     "mc_mae",
     "mc_expected_log_tile_mae",
@@ -53,6 +54,22 @@ def table(rows, fields, path):
     )
 
 
+def normalize_probability_metrics(metrics):
+    metrics = dict(metrics)
+    if (
+        "expected_log_tile_mean_bias" not in metrics
+        and metrics.get("predicted_expected_log_tile") is not None
+        and metrics.get("observed_mean_log_tile") is not None
+    ):
+        bias = (
+            metrics["predicted_expected_log_tile"]
+            - metrics["observed_mean_log_tile"]
+        )
+        metrics["expected_log_tile_mean_bias"] = bias
+        metrics["expected_log_tile_mean_absolute_bias"] = abs(bias)
+    return metrics
+
+
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument(
@@ -77,7 +94,7 @@ if __name__ == "__main__":
                     key: generation[key]
                     for key in ("objective", "seed", "generation", "target_policy_id")
                 }
-                r.update(generation["probability"])
+                r.update(normalize_probability_metrics(generation["probability"]))
                 r.update(generation["training_stats"])
                 rows.append({key: r.get(key) for key in FIELDS})
                 for role in ("incumbent", "candidate"):
@@ -97,7 +114,9 @@ if __name__ == "__main__":
         c = json.loads((root / "resolved_config.json").read_text())["config"]
         r = (
             dict(objective=c["objective"], seed=c["seed"])
-            | json.loads((root / "metrics.json").read_text())
+            | normalize_probability_metrics(
+                json.loads((root / "metrics.json").read_text())
+            )
             | json.loads((root / "training_stats.json").read_text())
         )
         rows.append({k: r.get(k) for k in FIELDS})

@@ -78,14 +78,17 @@ def observed_metrics(p, rows):
     onehot = np.eye(len(OUTCOMES))[y]
     predicted_log_tile = p @ LOG_TILE_UTILITIES
     observed_log_tile = LOG_TILE_UTILITIES[y]
+    predicted_mean_log_tile = float(predicted_log_tile.mean())
+    observed_mean_log_tile = float(observed_log_tile.mean())
+    mean_bias = predicted_mean_log_tile - observed_mean_log_tile
     result = dict(
         top1_accuracy=float((p.argmax(-1) == y).mean()),
         observed_nll=float(-np.log(np.maximum(p[np.arange(len(y)), y], 1e-30)).mean()),
         observed_brier=float(((p - onehot) ** 2).sum(-1).mean()),
-        predicted_expected_log_tile=float(predicted_log_tile.mean()),
-        observed_mean_log_tile=float(observed_log_tile.mean()),
-        observed_log_tile_mae=float(abs(predicted_log_tile - observed_log_tile).mean()),
-        observed_log_tile_mse=float(((predicted_log_tile - observed_log_tile) ** 2).mean()),
+        predicted_expected_log_tile=predicted_mean_log_tile,
+        observed_mean_log_tile=observed_mean_log_tile,
+        expected_log_tile_mean_bias=mean_bias,
+        expected_log_tile_mean_absolute_bias=abs(mean_bias),
         events={},
     )
     for threshold in (1024, 2048, 4096):

@@ -2,7 +2,7 @@
 # Short end-to-end run for a first look: about 25 minutes at the measured throughput.
 #SBATCH --job-name=jevmath-quick
 #SBATCH --gres=gpu:1
-#SBATCH --cpus-per-task=8
+#SBATCH --cpus-per-task=24
 #SBATCH --mem=48G
 #SBATCH --time=01:30:00
 #SBATCH --output=logs/slurm/%x-%j.out

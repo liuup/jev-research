@@ -3,7 +3,7 @@
 # to confirm the measured settings fit and run end to end.
 #SBATCH --job-name=jevmath-smoke-tuned
 #SBATCH --gres=gpu:1
-#SBATCH --cpus-per-task=8
+#SBATCH --cpus-per-task=24
 #SBATCH --mem=48G
 #SBATCH --time=02:00:00
 #SBATCH --output=logs/slurm/%x-%j.out

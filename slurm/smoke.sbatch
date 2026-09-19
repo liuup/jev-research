@@ -2,7 +2,7 @@
 # One tiny generation end to end: dataset, rollouts, paired-PG update, evaluation.
 #SBATCH --job-name=jevmath-smoke
 #SBATCH --gres=gpu:1
-#SBATCH --cpus-per-task=8
+#SBATCH --cpus-per-task=24
 #SBATCH --mem=48G
 #SBATCH --time=04:00:00
 #SBATCH --output=logs/slurm/%x-%j.out

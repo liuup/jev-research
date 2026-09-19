@@ -2,6 +2,26 @@
 
 # Offline Jev / RLCD for 2048
 
+## 新输入协议：只以达到 2048 为目标
+
+`task=reach_2048`：STATE 是尚未成功的棋盘；ACTION 是一个合法首动作；QUESTION 是执行该动作后按指定冻结策略继续，能否在无合法动作前达到 2048；OPTIONS 为 `YES/NO`（内部 ID：`yes/no`）。成功后立即结束。
+
+`serialization.action_questions(game, continuation_policy_id)` 同时构建所有合法方向的问题，`controller.analyze_reach_2048(...)` 在一次批量前向中返回 `{动作: {yes: 概率, no: 概率}}`。四个合法动作对应八条候选路径；每个动作独立归一化。选择 `yes` 概率最大的合法动作，不在动作之间做 softmax。
+
+二分类数据转换、训练指标、MC 评估与整局成功即停止的控制流程已接通。历史七分类 checkpoint 仅供历史实验使用；新实验从共同的未训练初始化开始。向量 Brier 是二分类标量 Brier 的两倍。训练日志不再记录 log-tile 指标。
+
+```bash
+# 已生成的 success_pi0_v1 / success_smoke_v1 不可覆盖
+uv run python scripts/convert_success_data.py --output data/success_pi0_v1
+uv run python scripts/audit_data.py --data-dir data/success_pi0_v1
+sbatch slurm/success_smoke.sbatch
+# GPU 评估和游戏必须放在 Slurm 分配内，使用以下入口
+# uv run python scripts/evaluate.py --run runs/success_paired_pg_smoke_seed17
+# uv run python scripts/play.py --run runs/success_paired_pg_smoke_seed17 --games 10
+```
+
+转换保留所有源游戏 split，每条标签仍来自一次环境反馈；MC 合并后的 YES/NO 分布只用于评估。以下章节保留原七分类实验的复现说明。
+
 本项目使用本地 `/root/shang/hf-modles/Qwen3.5-0.8B-Base` 研究静态数据上的 Jev 风格结果预测。模型不是动作分类器：对每个合法动作分别预测
 
 `p(终局最大砖 | 当前棋盘, 首个动作, 冻结启发式 continuation π0)`。

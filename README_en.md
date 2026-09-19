@@ -2,6 +2,22 @@
 
 # Offline Jev / RLCD for 2048
 
+## New input contract: reach 2048
+
+For `task=reach_2048`, STATE is a board below 2048, ACTION is a legal first move, QUESTION asks whether the specified frozen continuation policy will reach 2048 before no legal moves remain, and OPTIONS are YES/NO (IDs `yes/no`). Success ends the episode immediately.
+
+`serialization.action_questions(game, continuation_policy_id)` builds all legal-action questions. `controller.analyze_reach_2048(...)` returns `{action: {yes: probability, no: probability}}` in one batched forward. Four legal actions use eight candidate paths, normalized independently per action. Choose the legal action with highest YES probability.
+
+Binary data conversion, training metrics, MC evaluation and success-stopping full-game control are implemented. New runs start from the common untrained initialization. Vector Brier equals twice scalar binary Brier; binary logs omit log-tile metrics. Historical checkpoints remain seven-class models.
+
+```bash
+uv run python scripts/convert_success_data.py --output data/success_pi0_v1
+uv run python scripts/audit_data.py --data-dir data/success_pi0_v1
+sbatch slurm/success_smoke.sbatch
+```
+
+Conversion refuses existing output directories and preserves source-game splits. Each label remains one observed event; aggregated MC distributions are evaluation-only. The sections below describe the historical seven-class experiment.
+
 This project uses the local `/root/shang/hf-modles/Qwen3.5-0.8B-Base` checkpoint to study Jev-style outcome prediction on a static dataset. It is not an action classifier. For every legal action it separately predicts
 
 `p(terminal maximum tile | board, first action, frozen heuristic continuation π0)`.

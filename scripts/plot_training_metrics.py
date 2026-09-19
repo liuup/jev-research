@@ -69,6 +69,8 @@ def plot_metrics(records, output, smooth, title, phase_boundaries=()):
         ("observed_brier", "Vector Brier score"),
         ("expected_log_tile_mean_bias", "Mean expected log-tile bias"),
     )
+    if "predicted_success_probability" in records[0]["train"]:
+        definitions = definitions[:2] + (("predicted_success_probability", "Mean P(reach 2048)"),)
     figure, axes = plt.subplots(3, 1, figsize=(11, 10), sharex=True)
     for axis, (key, label) in zip(axes, definitions):
         train = np.array([metric(row, "train", key) for row in records])

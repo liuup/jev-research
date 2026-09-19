@@ -1,0 +1,12 @@
+inherit: train_paired_pg.yaml
+task: reach_2048
+continuation_policy_id: heuristic:3cd506a8cc3031cb1fae7b29b3c0b9d100f2f7142c0dc50f3467061d066b9e7c
+data_dir: data/success_pi0_v1
+common_init: runs/success_common_init.pt
+steps: 500
+track_best: true
+evaluate_best: true
+selection_metric: observed_brier
+selection_mode: min
+evaluate_after_training: true
+save_final_checkpoint: true

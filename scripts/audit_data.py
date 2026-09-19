@@ -7,7 +7,7 @@ from pathlib import Path
 
 from jev2048.dataset import read_rows
 from jev2048.env import Game
-from jev2048.serialization import OUTCOMES
+from jev2048.serialization import candidates
 from jev2048.utils import digest, save_json
 
 if __name__ == "__main__":
@@ -25,7 +25,11 @@ if __name__ == "__main__":
         groups = defaultdict(list)
         seeds = set()
         for r in rows:
-            assert "q" not in r and r["observed_outcome"] in OUTCOMES
+            assert "q" not in r and r["observed_outcome"] in candidates(r)
+            if manifest.get("task") == "reach_2048":
+                assert r["task"] == "reach_2048"
+                assert max(map(max, r["board"])) < 2048
+                assert (r["observed_outcome"] == "yes") == (r["terminal_max_tile"] >= 2048)
             assert r["continuation_policy_id"] == expected_policy_id
             assert r["terminal_max_tile"] >= 2
             assert r["terminal_score"] >= r["score"]

@@ -9,7 +9,7 @@ from matplotlib.backends.backend_agg import FigureCanvasAgg
 from matplotlib.figure import Figure
 
 from .dataset import collate
-from .serialization import OUTCOMES
+from .serialization import OUTCOMES, candidates
 
 LOG_TILE_UTILITIES = np.array([7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0])
 
@@ -74,6 +74,19 @@ def reliability(p, y, bins=10):
 
 
 def observed_metrics(p, rows):
+    if rows[0].get("task") == "reach_2048":
+        y = np.array([candidates(r).index(r["observed_outcome"]) for r in rows])
+        yes = np.array([p[i, candidates(r).index("yes")] for i, r in enumerate(rows)])
+        event = np.array([r["observed_outcome"] == "yes" for r in rows], dtype=float)
+        ece, diagram = reliability(yes, event)
+        return dict(top1_accuracy=float((p.argmax(-1) == y).mean()),
+                    observed_nll=float(-np.log(np.maximum(p[np.arange(len(y)), y], 1e-30)).mean()),
+                    observed_brier=float(((p - np.eye(2)[y]) ** 2).sum(-1).mean()),
+                    binary_brier=float(((yes - event) ** 2).mean()),
+                    predicted_success_probability=float(yes.mean()),
+                    observed_success_rate=float(event.mean()), ece_ge2048=ece,
+                    events={"2048": dict(brier=float(((yes-event)**2).mean()),
+                                         ece=ece, reliability=diagram)})
     y = np.array([OUTCOMES.index(r["observed_outcome"]) for r in rows])
     onehot = np.eye(len(OUTCOMES))[y]
     predicted_log_tile = p @ LOG_TILE_UTILITIES
@@ -108,6 +121,11 @@ def observed_metrics(p, rows):
 def mc_metrics(p, rows):
     q = np.array([r["q"] for r in rows])
     mid = (p + q) / 2
+    if p.shape[1] == 2:
+        return dict(mc_squared_l2=float(((p-q)**2).sum(-1).mean()),
+                    mc_mae=float(np.abs(p-q).mean()),
+                    mc_js=float((p * np.log(np.maximum(p, 1e-30) / np.maximum(mid, 1e-30))
+                                 + q * np.log(np.maximum(q, 1e-30) / np.maximum(mid, 1e-30))).sum(-1).mean()/2))
     predicted_log_tile = p @ LOG_TILE_UTILITIES
     reference_log_tile = q @ LOG_TILE_UTILITIES
 
@@ -139,7 +157,7 @@ def plot_reliability(metrics, name):
     Path("results/plots").mkdir(parents=True, exist_ok=True)
     fig = Figure(figsize=(12, 4))
     FigureCanvasAgg(fig)
-    axes = fig.subplots(1, 3)
+    axes = np.atleast_1d(fig.subplots(1, len(metrics["events"])))
     for ax, (threshold, event) in zip(axes, metrics["events"].items()):
         rows = [r for r in event["reliability"] if r["count"]]
         ax.plot([0, 1], [0, 1], "--", color="gray")

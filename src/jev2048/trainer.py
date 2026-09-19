@@ -19,6 +19,7 @@ from .online_trainer import run_online
 from .optimization import optimization_step
 from .runtime import atomic_checkpoint, checkpoint, load_checkpoint, require_slurm
 from .serialization import OUTCOMES as OUTCOME_IDS
+from .serialization import candidates
 from .utils import digest, save_json, seed_all
 
 
@@ -80,7 +81,7 @@ def evaluate_run(model, tok, config, output, plot_name=None):
                     state_id=r["state_id"],
                     action=r["action"],
                     observed_outcome=r["observed_outcome"],
-                    candidate_ids=OUTCOME_IDS,
+                    candidate_ids=candidates(r),
                     probabilities=p.tolist(),
                 )
                 for r, p in zip(rows, probs)
@@ -165,6 +166,16 @@ def main():
     for split, info in manifest["splits"].items():
         assert info["sha256"] == digest(root / f"{split}.jsonl")
     rows = read_rows(root / "train.jsonl")
+    if manifest.get("task", "terminal_max_tile") != c.get("task", "terminal_max_tile"):
+        raise ValueError("Dataset and training task differ")
+    if c.get("task") == "reach_2048":
+        assert c["continuation_policy_id"] == f"heuristic:{manifest['policy_sha256']}"
+        for split in manifest["splits"]:
+            for row in read_rows(root / f"{split}.jsonl"):
+                assert row.get("task") == "reach_2048" and candidates(row) == ["yes", "no"]
+                assert row["continuation_policy_id"] == c["continuation_policy_id"]
+                assert max(map(max, row["board"])) < 2048
+                assert row["observed_outcome"] in ("yes", "no")
     dev = read_rows(root / "dev.jsonl")[: c["eval_questions"]]
     assert all("q" not in r for r in rows)
     output = Path(args.output or f"runs/offline_{c['objective']}_seed{c['seed']}")
@@ -175,6 +186,8 @@ def main():
         if not resume_path.exists():
             raise FileNotFoundError(resume_path)
         model, saved = load_checkpoint(resume_path)
+        if saved["config"].get("task") != c.get("task"):
+            raise ValueError("Cannot resume a different task")
         start_phase_step = saved.get("phase_step", saved["step"])
         global_step_offset = saved.get("global_step_offset", 0)
         load_optimizer_state = True
@@ -183,6 +196,8 @@ def main():
         if any(output.iterdir()):
             raise FileExistsError(f"Use a fresh run directory: {output}")
         model, saved = load_checkpoint(continuation_from)
+        if saved["config"].get("task") != c.get("task"):
+            raise ValueError("Cannot continue a different task")
         start_phase_step = 0
         global_step_offset = saved["step"]
         load_optimizer_state = True

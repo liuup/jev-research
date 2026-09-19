@@ -10,6 +10,7 @@ from jev2048.dataset import collate, mc_pair, read_rows
 from jev2048.env import Game
 from jev2048.model import DecisionHead, JevModel
 from jev2048.serialization import OUTCOMES, bucket, serialize
+from jev2048.serialization import action_questions
 
 
 def row():
@@ -36,6 +37,29 @@ class Tokenizer:
             input_ids=torch.ones(len(paths), 4, dtype=torch.long),
             attention_mask=torch.ones(len(paths), 4, dtype=torch.long),
         )
+
+
+def test_success_action_batch_and_no_label_leakage():
+    game = Game(board=((0, 0, 0, 0), (0, 2, 2, 0), (0, 0, 0, 0), (0, 0, 0, 0)))
+    rows = action_questions(game, "heuristic:frozen")
+    assert [r["action"] for r in rows] == game.legal_actions
+    assert len(rows) == 4
+    batch = collate(rows, Tokenizer())
+    assert batch["offsets"] == [0, 2, 4, 6, 8]
+    assert batch["targets"].tolist() == [-1] * 4
+    assert batch["mask"].all()
+    text = serialize(rows[0], "yes")
+    assert "[OPTIONS]\nYES\nNO" in text
+    assert text.endswith("[CANDIDATE]\nYES")
+    assert serialize(rows[0] | {"observed_outcome": "no"}, "yes") == text
+    labeled = rows[0] | {"observed_outcome": "no"}
+    assert collate([labeled], Tokenizer())["targets"].tolist() == [1]
+
+
+def test_success_rejects_completed_board():
+    game = Game(board=((2048, 0, 0, 0), (0, 0, 0, 0), (0, 0, 0, 0), (0, 0, 0, 0)))
+    with pytest.raises(ValueError):
+        action_questions(game, "heuristic:frozen")
 
 
 def test_batch_variable_candidates():

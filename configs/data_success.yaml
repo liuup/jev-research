@@ -1,0 +1,10 @@
+task: reach_2048
+seed: 17
+heuristic_config: configs/heuristic.yaml
+questions: {train: 100000, dev: 2048, calibration: 2048, test: 4096}
+split_seeds: {train: 17000000, dev: 27000000, calibration: 37000000, test: 47000000}
+random_action_probability: 0.15
+select_every: 16
+workers: 24
+reference_states: 64
+reference_rollouts: 256

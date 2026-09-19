@@ -7,10 +7,14 @@ import torch
 from .dataset import collate
 from .objectives import loss
 from .serialization import OUTCOMES as OUTCOME_IDS
+from .serialization import candidates
 
 
 def optimization_step(model, tok, batch_rows, optimizer, scheduler, c, micro):
     device = next(model.parameters()).device
+    outcome_ids = candidates(batch_rows[0])
+    if any(candidates(row) != outcome_ids for row in batch_rows):
+        raise ValueError("Training requires a consistent candidate order")
     step_start = time.monotonic()
     cpu_rng = torch.get_rng_state()
     cuda_rng = torch.cuda.get_rng_state() if device.type == "cuda" else None
@@ -20,7 +24,7 @@ def optimization_step(model, tok, batch_rows, optimizer, scheduler, c, micro):
             optimizer.zero_grad(set_to_none=True)
             total = 0.0
             metrics = {}
-            predicted_mass = torch.zeros(len(OUTCOME_IDS), device=device)
+            predicted_mass = torch.zeros(len(outcome_ids), device=device)
             observed_counts = torch.zeros_like(predicted_mass)
             for offset in range(0, len(batch_rows), micro):
                 subset = batch_rows[offset : offset + micro]
@@ -65,7 +69,7 @@ def optimization_step(model, tok, batch_rows, optimizer, scheduler, c, micro):
                         ) / len(batch_rows)
                     predicted_mass += p.sum(0)
                     observed_counts += torch.bincount(
-                        targets, minlength=len(OUTCOME_IDS)
+                        targets, minlength=len(outcome_ids)
                     )
             break
         except torch.cuda.OutOfMemoryError:
@@ -95,7 +99,7 @@ def optimization_step(model, tok, batch_rows, optimizer, scheduler, c, micro):
     metrics = {key: float(value) for key, value in metrics.items()}
     log_tile_utility = torch.arange(
         7,
-        7 + len(OUTCOME_IDS),
+        7 + len(outcome_ids),
         device=device,
         dtype=predicted_mass.dtype,
     )
@@ -112,6 +116,12 @@ def optimization_step(model, tok, batch_rows, optimizer, scheduler, c, micro):
         expected_log_tile_mean_bias=mean_log_tile_bias,
         expected_log_tile_mean_absolute_bias=abs(mean_log_tile_bias),
     )
+    if outcome_ids == ["yes", "no"]:
+        for key in ("predicted_expected_log_tile", "observed_mean_log_tile",
+                    "expected_log_tile_mean_bias", "expected_log_tile_mean_absolute_bias"):
+            metrics.pop(key)
+        metrics.update(predicted_success_probability=float(predicted_mass[0] / len(batch_rows)),
+                       observed_success_rate=float(observed_counts[0] / len(batch_rows)))
     if "advantage_second_moment" in metrics:
         metrics["advantage_std"] = (
             max(
@@ -134,8 +144,8 @@ def optimization_step(model, tok, batch_rows, optimizer, scheduler, c, micro):
         questions_per_second=len(batch_rows) / step_seconds,
         train=metrics,
         mean_predicted_distribution=dict(
-            zip(OUTCOME_IDS, (predicted_mass / len(batch_rows)).tolist())
+            zip(outcome_ids, (predicted_mass / len(batch_rows)).tolist())
         ),
-        observed_outcome_counts=dict(zip(OUTCOME_IDS, observed_counts.int().tolist())),
+        observed_outcome_counts=dict(zip(outcome_ids, observed_counts.int().tolist())),
     )
     return record, micro

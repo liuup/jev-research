@@ -60,6 +60,8 @@ if __name__ == "__main__":
             a.threshold,
             c["max_length"],
             inference_precision=a.inference_precision or "fp32",
+            task=c.get("task", "terminal_max_tile"),
+            continuation_policy_id=c.get("continuation_policy_id"),
         )
     print(
         json.dumps(dict(model_config=c, controller_config=vars(a)), indent=2),
@@ -71,7 +73,7 @@ if __name__ == "__main__":
         for seed in range(a.seed, a.seed + a.games):
             start = time.perf_counter()
             g = Game(seed)
-            while not g.terminal:
+            while not g.terminal and not (c.get("task") == "reach_2048" and g.max_tile >= 2048):
                 g.step(controller.choose(g))
             elapsed = time.perf_counter() - start
             total_seconds += elapsed

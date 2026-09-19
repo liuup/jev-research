@@ -12,7 +12,7 @@ import torch
 
 from .env import Game
 from .heuristic import HeuristicPolicy
-from .serialization import OUTCOMES, bucket, serialize
+from .serialization import OUTCOMES, bucket, candidates, serialize
 from .utils import digest, save_json
 
 
@@ -21,10 +21,11 @@ def rollout_event(state, action, seed, policy=None):
     policy = policy or HeuristicPolicy()
     if not game.step(action):
         raise ValueError("Illegal first action")
-    while not game.terminal:
+    binary = state.get("task") == "reach_2048"
+    while not game.terminal and not (binary and game.max_tile >= 2048):
         game.step(policy.choose(game))
     return dict(
-        observed_outcome=bucket(game.max_tile),
+        observed_outcome=("yes" if game.max_tile >= 2048 else "no") if binary else bucket(game.max_tile),
         terminal_max_tile=game.max_tile,
         terminal_score=game.score,
         rollout_steps=game.steps - state["steps"],
@@ -43,9 +44,12 @@ def source_game(args):
     rollout_rng = random.Random(game_seed + 2000000000)
     policy_id = f"heuristic:{digest(config['heuristic_config'])}"
     rows = []
-    while not game.terminal:
+    binary = config.get("task") == "reach_2048"
+    while not game.terminal and not (binary and game.max_tile >= 2048):
         if game.steps % config["select_every"] == 0:
             state = game.state()
+            if binary:
+                state.update(task="reach_2048", candidate_ids=["yes", "no"])
             for action in game.legal_actions:
                 seed = rollout_rng.randrange(2**63)
                 rows.append(
@@ -87,6 +91,7 @@ def generate(config, output):
     assert benchmark["policy_sha256"] == digest(config["heuristic_config"])
     manifest = dict(
         schema_version=2,
+        task=config.get("task", "terminal_max_tile"),
         config=config,
         git_commit=subprocess.check_output(
             ["git", "rev-parse", "HEAD"], text=True
@@ -152,11 +157,12 @@ def read_rows(path):
 
 def mc_pair(args):
     row, repeats, seed, heuristic_config = args
-    counts = np.zeros(len(OUTCOMES), dtype=int)
+    ids = candidates(row)
+    counts = np.zeros(len(ids), dtype=int)
     rng, policy = random.Random(seed), HeuristicPolicy(heuristic_config)
     for _ in range(repeats):
         counts[
-            OUTCOMES.index(rollout(row, row["action"], rng.randrange(2**63), policy))
+            ids.index(rollout(row, row["action"], rng.randrange(2**63), policy))
         ] += 1
     return {
         k: v
@@ -229,7 +235,7 @@ def build_reference(data_dir, states=64, repeats=256, workers=16, seed=717):
 
 
 def collate(rows, tokenizer, max_length=512):
-    ids = [list(r.get("candidate_ids", OUTCOMES)) for r in rows]
+    ids = [candidates(r) for r in rows]
     if any(not x or len(x) != len(set(x)) for x in ids):
         raise ValueError("Empty or duplicate candidates")
     paths = [serialize(r, c) for r, cs in zip(rows, ids) for c in cs]

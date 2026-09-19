@@ -19,7 +19,7 @@ source_envs: 64
 behavior_epsilon: 0.20
 select_every: 1
 effective_batch: 256
-microbatch: 256
+microbatch: 128
 
 backbone_lr: 0.00002
 head_lr: 0.0002

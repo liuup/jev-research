@@ -1,9 +1,10 @@
+import json
 from fractions import Fraction
 
 import pytest
 
 from jevmath.env import CandidateError, State, apply_op, forced_stop_value
-from jevmath.gsm8k import final_answer, question_numbers
+from jevmath.gsm8k import final_answer, load_rows, question_numbers
 
 ROW = dict(
     id="demo",
@@ -88,6 +89,21 @@ def test_pool_collapse_forces_a_deterministic_answer():
         state = state.combine(state.candidates()[0])
     assert forced_stop_value(state) == state.quantities[0][0]
     assert len(state.candidates()) == 1 and state.candidates()[0]["kind"] == "STOP"
+
+
+def test_load_rows_assigns_unique_stable_ids(tmp_path):
+    path = tmp_path / "train.jsonl"
+    path.write_text(
+        "\n".join(
+            json.dumps(dict(question=f"Add {index} and 1.", answer=f"#### {index + 1}"))
+            for index in range(3)
+        )
+        + "\n"
+    )
+    rows = load_rows(path)
+    assert [row["id"] for row in rows] == ["train:0", "train:1", "train:2"]
+    assert len({row["id"] for row in rows}) == 3
+    assert rows[1]["gold"] == 2
 
 
 def test_gsm8k_parsing():

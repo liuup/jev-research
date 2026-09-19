@@ -45,8 +45,10 @@ def question_numbers(question):
 
 
 def load_rows(path):
+    """Usable questions with a stable id: the raw files carry no id field."""
+    path = Path(path)
     rows = []
-    for line in Path(path).read_text().splitlines():
+    for index, line in enumerate(path.read_text().splitlines()):
         if not line.strip():
             continue
         record = json.loads(line)
@@ -56,7 +58,7 @@ def load_rows(path):
             continue
         rows.append(
             dict(
-                id=record.get("id"),
+                id=record.get("id") or f"{path.stem}:{index}",
                 question=question,
                 gold=final_answer(record["answer"]),
                 numbers=numbers,

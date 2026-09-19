@@ -1,18 +1,16 @@
-"""Probe batch sizes against GPU memory and throughput to pick the run defaults.
+"""Probe batch sizes against GPU memory and throughput for the 24 game.
 
-Measures the three shapes that matter:
+Three shapes matter and they are measured on real puzzle states:
 
-* rollout scoring: ``inference_questions`` candidate questions per forward,
-* a training step: ``microbatch`` questions per backward with gradient accumulation,
-* padded prompt length and the real token volume behind each number.
+* forward scoring: ``inference_questions`` candidate questions per forward,
+* whole-state scoring: exactly what collection calls, including tokenization,
+* a training step: ``microbatch`` questions per backward with gradient accumulation.
 
-The largest setting inside the memory budget wins; every measurement is written to
-``results/benchmark_batches.json`` together with the OOM boundaries.
+Every measurement lands in ``results/benchmark_batches.json`` together with the OOM list.
 """
 
 import argparse
 import json
-import os
 import time
 from pathlib import Path
 
@@ -22,25 +20,30 @@ from jevmath.config import load_config
 from jevmath.dataset import collate
 from jevmath.env import State
 from jevmath.evaluation import inference_precision
-from jevmath.gsm8k import load_rows
 from jevmath.model import JevModel, load_tokenizer
-from jevmath.objectives import loss
 from jevmath.optimization import optimization_step
+from jevmath.puzzles import load_puzzles
 from jevmath.rollout import score_candidates
 from jevmath.runtime import require_slurm
 from jevmath.serialization import question_row
 from jevmath.utils import save_json, seed_all
 
 
-def build_questions(states, tokenizer, config, count):
-    """Real candidate questions, in environment order, until ``count`` is reached."""
+def states_of(puzzles, count):
+    states = [State.initial(puzzle) for puzzle in puzzles[:count]]
+    return [(state, state.actions()) for state in states]
+
+
+def build_questions(puzzles, policy_id, count):
+    """Candidate questions in environment order, as many as the puzzles can supply."""
     rows = []
-    for state in states:
-        for candidate in state.candidates():
-            rows.append(question_row(state, candidate, "benchmark"))
+    for puzzle in puzzles:
+        state = State.initial(puzzle)
+        for action in state.actions():
+            rows.append(question_row(state, action, policy_id))
             if len(rows) >= count:
                 return rows
-    raise ValueError(f"Only {len(rows)} candidate questions available")
+    return rows
 
 
 def peak_gib():
@@ -50,7 +53,6 @@ def peak_gib():
 def measure_forward(model, tokenizer, rows, config, precision, repeats=3):
     batch = collate(rows, tokenizer, config["max_length"])
     tokens = int(batch["tokens"]["input_ids"].numel())
-    lengths = batch["tokens"]["attention_mask"].sum(-1)
     model.eval()
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
@@ -71,11 +73,30 @@ def measure_forward(model, tokenizer, rows, config, precision, repeats=3):
         sequences=int(batch["tokens"]["input_ids"].shape[0]),
         tokens=tokens,
         padded_length=int(batch["tokens"]["input_ids"].shape[1]),
-        mean_question_tokens=float(lengths.float().mean()),
         peak_gib=peak_gib(),
         seconds=best,
         questions_per_second=len(rows) / best,
         tokens_per_second=tokens / best,
+    )
+
+
+def measure_rollout(model, tokenizer, entries, config, count):
+    chosen = entries[:count]
+    questions = sum(len(actions) for _, actions in chosen)
+    torch.cuda.empty_cache()
+    torch.cuda.reset_peak_memory_stats()
+    started = time.perf_counter()
+    score_candidates(model, tokenizer, chosen, config)
+    torch.cuda.synchronize()
+    seconds = time.perf_counter() - started
+    return dict(
+        mode="rollout",
+        states=count,
+        questions=questions,
+        peak_gib=peak_gib(),
+        seconds=seconds,
+        states_per_second=count / seconds,
+        questions_per_second=questions / seconds,
     )
 
 
@@ -86,9 +107,9 @@ def measure_training_step(
     model.train()
     torch.cuda.empty_cache()
     torch.cuda.reset_peak_memory_stats()
-    seconds = []
+    seconds, record = [], None
     for attempt in range(repeats + 1):
-        record, actual_micro = optimization_step(
+        record, actual = optimization_step(
             model, tokenizer, rows, optimizer, scheduler, config, micro
         )
         if attempt:
@@ -97,163 +118,147 @@ def measure_training_step(
     return dict(
         mode="train",
         objective=objective,
-        microbatch=actual_micro,
+        microbatch=record["microbatch"],
+        requested_microbatch=micro,
         rows=len(rows),
         gradient_accumulation=record["gradient_accumulation"],
         peak_gib=peak_gib(),
         seconds=best,
-        questions_per_second=len(rows) / best,
-        gradient_norm=record["gradient_norm"],
+        rows_per_second=len(rows) / best,
     )
 
 
-def measure_rollout(model, tokenizer, states, config, count):
-    """Whole-state scoring exactly as collection calls it, including tokenization."""
-    entries = [(state, state.candidates()) for state in states[:count]]
-    questions = sum(len(candidates) for _, candidates in entries)
-    torch.cuda.empty_cache()
-    torch.cuda.reset_peak_memory_stats()
-    started = time.perf_counter()
-    score_candidates(model, tokenizer, entries, config)
-    torch.cuda.synchronize()
-    seconds = time.perf_counter() - started
-    return dict(
-        mode="rollout",
-        states=len(entries),
-        questions=questions,
-        peak_gib=peak_gib(),
-        seconds=seconds,
-        states_per_second=len(entries) / seconds,
-        questions_per_second=questions / seconds,
-    )
-
-
-def sweep(label, function, sizes, oom, budget):
+def sweep(name, sizes, measure, budget_gib, oom, report):
     rows = []
     for size in sizes:
         try:
-            measurement = function(size)
+            row = measure(size)
         except torch.cuda.OutOfMemoryError:
-            oom.append(dict(section=label, size=size))
             torch.cuda.empty_cache()
-            print(json.dumps(dict(section=label, size=size, result="oom")), flush=True)
-            break
-        measurement["size"] = size
-        measurement["within_budget"] = measurement["peak_gib"] <= budget
-        rows.append(measurement)
-        print(json.dumps(dict(section=label, **measurement)), flush=True)
-    return rows
+            oom.append(dict(section=name, size=size))
+            print(json.dumps(dict(section=name, size=size, oom=True)), flush=True)
+            continue
+        row["size"] = size
+        rows.append(row)
+        print(json.dumps(dict(section=name, **row)), flush=True)
+    report[name] = rows
+    inside = [row for row in rows if row["peak_gib"] <= budget_gib]
+    return inside
 
 
-if __name__ == "__main__":
-    assert os.environ.get("SLURM_JOB_ID"), "GPU work must run under Slurm"
+def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--data-dir", default="data/24game")
     parser.add_argument("--config", default="configs/train.yaml")
-    parser.add_argument("--problems", type=int, default=24)
-    parser.add_argument("--budget-gib", type=float, default=26.0)
+    parser.add_argument("--puzzles", type=int, default=24)
     parser.add_argument("--forward-sizes", type=int, nargs="+", default=[16, 32, 64, 128, 256, 512])
-    parser.add_argument("--train-sizes", type=int, nargs="+", default=[4, 8, 16, 32, 64, 128])
     parser.add_argument("--rollout-states", type=int, nargs="+", default=[4, 8, 16, 24])
+    parser.add_argument("--train-sizes", type=int, nargs="+", default=[4, 8, 16, 32, 64, 128])
     parser.add_argument("--effective-batch", type=int, default=64)
+    parser.add_argument("--budget-gib", type=float, default=26.0)
     parser.add_argument("--output", default="results/benchmark_batches.json")
     args = parser.parse_args()
     require_slurm()
-    torch.set_num_threads(4)
+
     config = load_config("configs/model.yaml") | load_config(args.config)
     config["policy_id"] = "benchmark"
     seed_all(config["seed"])
-    model = JevModel.load_base(config).cuda()
+    model = JevModel.load_base(config).float().cuda()
     tokenizer = load_tokenizer(config["base_model"])
-    problems = [row for row in load_rows(Path(config["data_dir"]) / "train.jsonl") if len(row["numbers"]) >= 3][: args.problems]
-    states = [State.initial(row) for row in problems]
-    sizes = [len(state.quantities) for state in states]
-    candidates = [len(state.candidates()) for state in states]
-    questions = build_questions(states, tokenizer, config, max(args.forward_sizes))
-    optimizer = torch.optim.AdamW(
-        [
-            dict(params=model.backbone.parameters(), lr=1e-8),
-            dict(params=model.head.parameters(), lr=1e-7),
-        ],
-        foreach=False,
-    )
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda step: 1.0)
-    train_rows = [dict(row, observed_outcome="yes" if index % 2 else "no") for index, row in enumerate(questions[: max(args.train_sizes)])]
+    available = load_puzzles(Path(args.data_dir) / "train.jsonl")
+    puzzles = available[: args.puzzles]
+    entries = states_of(puzzles, len(puzzles))
+    forward_puzzles = available[: max(args.puzzles, 96)]
+    rows = build_questions(forward_puzzles, "benchmark", max(args.forward_sizes))
+    training_rows = [
+        row
+        | dict(
+            observed_outcome="yes" if index % 3 == 0 else "no",
+        )
+        for index, row in enumerate(build_questions(puzzles, "benchmark", 512))
+    ]
+
     report = dict(
         config=dict(
-            max_length=config["max_length"],
-            problems=len(problems),
-            pool_sizes=sizes,
-            candidates_per_state=candidates,
-            effective_batch=args.effective_batch,
+            puzzles=len(puzzles),
+            action_counts=[len(actions) for _, actions in entries],
             budget_gib=args.budget_gib,
-        ),
-        model=dict(
-            text_parameters=sum(p.numel() for p in model.backbone.parameters()),
-            head_parameters=sum(p.numel() for p in model.head.parameters()),
         ),
         sections={},
         oom=[],
     )
-    for precision in ("fp32", "bf16"):
-        label = f"forward_{precision}"
-        report["sections"][label] = sweep(
-            label,
-            lambda size, precision=precision: measure_forward(
-                model, tokenizer, questions[:size], config, precision
-            ),
-            args.forward_sizes,
-            report["oom"],
-            args.budget_gib,
-        )
-    report["sections"]["rollout"] = sweep(
-        "rollout",
-        lambda count: measure_rollout(model, tokenizer, states, config, count),
-        [size for size in args.rollout_states if size <= len(states)],
-        report["oom"],
+    asked = list(args.forward_sizes)
+    sizes = [size for size in asked if size <= len(rows)]
+    if len(sizes) < len(asked):
+        print(json.dumps(dict(skipped_sizes=[s for s in asked if s > len(rows)], available=len(rows))), flush=True)
+    forward = sweep(
+        "forward_fp32",
+        sizes,
+        lambda size: measure_forward(
+            model,
+            tokenizer,
+            rows[:size],
+            config,
+            "fp32",
+        ),
         args.budget_gib,
+        report["oom"],
+        report["sections"],
     )
-    for objective in ("paired_pg", "ce"):
-        label = f"train_{objective}"
-        report["sections"][label] = sweep(
-            label,
+    sweep(
+        "forward_bf16",
+        sizes,
+        lambda size: measure_forward(model, tokenizer, rows[:size], config, "bf16"),
+        args.budget_gib,
+        report["oom"],
+        report["sections"],
+    )
+    sweep(
+        "rollout",
+        args.rollout_states,
+        lambda size: measure_rollout(model, tokenizer, entries, config, size),
+        args.budget_gib,
+        report["oom"],
+        report["sections"],
+    )
+    optimizer = torch.optim.AdamW(model.parameters(), lr=config["head_lr"])
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lambda step: 1.0)
+    training = [
+        training_rows[index % len(training_rows)]
+        for index in range(args.effective_batch)
+    ]
+    train_rows = {}
+    for objective in ("paired_pg", "brier"):
+        train_rows[objective] = sweep(
+            f"train_{objective}",
+            args.train_sizes,
             lambda size, objective=objective: measure_training_step(
                 model,
                 tokenizer,
-                train_rows,
+                training,
                 config,
                 optimizer,
                 scheduler,
                 size,
                 objective,
             ),
-            [size for size in args.train_sizes if size <= len(train_rows)],
-            report["oom"],
             args.budget_gib,
+            report["oom"],
+            report["sections"],
         )
-    model.backbone.gradient_checkpointing_disable()
-    report["sections"]["train_ce_no_checkpointing"] = sweep(
-        "train_ce_no_checkpointing",
-        lambda size: measure_training_step(
-            model, tokenizer, train_rows, config, optimizer, scheduler, size, "ce"
-        ),
-        [size for size in args.train_sizes if size <= len(train_rows)],
-        report["oom"],
-        args.budget_gib,
-    )
-    model.backbone.gradient_checkpointing_enable(
-        gradient_checkpointing_kwargs={"use_reentrant": False}
-    )
     report["recommendation"] = {}
-    for label, rows in report["sections"].items():
-        inside = [row for row in rows if row["within_budget"]]
+    for name, inside in [("forward_fp32", forward)] + list(train_rows.items()):
         if not inside:
-            report["recommendation"][label] = None
+            report["recommendation"][name] = None
             continue
-        best = max(inside, key=lambda row: row["questions_per_second"])
+        best = max(inside, key=lambda row: row.get("questions_per_second", row.get("rows_per_second", 0.0)))
         largest = max(inside, key=lambda row: row["size"])
-        report["recommendation"][label] = dict(
-            throughput_choice=dict(size=best["size"], questions_per_second=best["questions_per_second"], peak_gib=best["peak_gib"]),
-            largest_inside_budget=dict(size=largest["size"], questions_per_second=largest["questions_per_second"], peak_gib=largest["peak_gib"]),
+        report["recommendation"][name] = dict(
+            throughput_choice=best, largest_inside_budget=largest
         )
     save_json(args.output, report)
-    print(json.dumps(dict(recommendation=report["recommendation"], oom=report["oom"]), indent=2), flush=True)
+    print(json.dumps(report, indent=2, default=str))
+
+
+if __name__ == "__main__":
+    main()

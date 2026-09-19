@@ -1,4 +1,4 @@
-"""Final evaluation of a trained run on the official GSM8K test split."""
+"""Final evaluation of a trained 24 game run on the test split."""
 
 import argparse
 import json

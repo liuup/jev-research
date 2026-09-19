@@ -108,8 +108,9 @@ def optimization_step(model, tokenizer, batch_rows, optimizer, scheduler, config
         gradient_norm=float(norm),
         microbatch=micro,
         gradient_accumulation=(len(batch_rows) + micro - 1) // micro,
+        learning_rates=learning_rates,
         backbone_lr=learning_rates[0],
-        head_lr=learning_rates[1],
+        head_lr=learning_rates[-1],
         step_seconds=time.monotonic() - started,
         train=metrics,
         mean_predicted_distribution=dict(

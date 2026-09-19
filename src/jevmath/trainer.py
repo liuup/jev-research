@@ -1,7 +1,12 @@
-"""Generation-wise online training: freeze a policy, collect rollouts, train, repeat."""
+"""Generation-wise online RLCD training on the 24 game.
+
+One generation is: freeze the current policy, roll out the training puzzles under it,
+keep one observed outcome per ``(state, action)``, train the head on those rows, then
+evaluate on the dev split. The learner never sees a label that its own ongoing updates
+produced, because collection finishes before the first optimizer step of a generation.
+"""
 
 import argparse
-import hashlib
 import json
 import random
 import subprocess
@@ -13,43 +18,35 @@ import torch
 import yaml
 
 from .config import load_config
-from .env import State
 from .evaluation import (
-    action_ranking,
     observed_metrics,
+    oracle_separation,
     plot_reliability,
     predict_rows,
     risk_coverage,
 )
-from .gsm8k import load_rows, split_rows
 from .model import JevModel, load_tokenizer
 from .optimization import optimization_step
+from .puzzles import load_oracle, load_puzzles, verify_manifest
 from .rollout import collect, record_json, rollout_batch, score_candidates
 from .runtime import atomic_checkpoint, load_checkpoint, require_slurm
 from .serialization import question_row
-from .utils import rate, save_json, seed_all, write_jsonl
+from .utils import rate, save_json, seed_all, stream_seed, write_jsonl
 
 INTEGER_KEYS = (
     "generations",
-    "problems_per_generation",
-    "rollouts_per_problem",
-    "max_steps",
+    "puzzles_per_generation",
+    "rollouts_per_puzzle",
     "steps_per_generation",
     "effective_batch",
     "microbatch",
-    "eval_every",
-    "checkpoint_every",
-    "validation_problems",
+    "warmup_steps",
+    "validation_puzzles",
+    "test_puzzles",
     "inference_questions",
     "reward_samples",
     "max_length",
-    "max_quantities",
 )
-
-
-def stream_seed(seed, *parts):
-    message = ":".join(map(str, (seed, *parts)))
-    return int.from_bytes(hashlib.sha256(message.encode()).digest()[:8], "big") % (2**63 - 1)
 
 
 def validate_config(c):
@@ -59,110 +56,100 @@ def validate_config(c):
     if c["microbatch"] > c["effective_batch"]:
         raise ValueError("microbatch must not exceed effective_batch")
     if c["objective"] not in ("paired_pg", "ce", "brier"):
-        raise ValueError("Unknown objective")
+        raise ValueError(f"Unknown objective: {c['objective']}")
     if c["baseline"] not in ("conditional", "zero"):
-        raise ValueError("Unknown paired-PG baseline")
-    if c["rollout_mode"] not in ("sample", "greedy"):
-        raise ValueError("Unknown rollout mode")
+        raise ValueError(f"Unknown baseline: {c['baseline']}")
     if c["inference_precision"] not in ("fp32", "bf16"):
-        raise ValueError("Unknown inference precision")
+        raise ValueError("inference_precision must be fp32 or bf16")
+    if c["rollout_mode"] not in ("sample", "greedy"):
+        raise ValueError("rollout_mode must be sample or greedy")
+    if c["init_policy"] not in ("model", "solver_mix"):
+        raise ValueError("init_policy must be model or solver_mix")
+    if not 0.0 <= c["init_solver_mix"] <= 1.0:
+        raise ValueError("init_solver_mix must lie in [0, 1]")
     if c["temperature"] <= 0:
         raise ValueError("temperature must be positive")
-    if not 0 < c["validation_fraction"] < 1:
-        raise ValueError("validation_fraction must lie in (0, 1)")
-    if c["reward_samples"] < 2:
-        raise ValueError("paired PG needs at least two samples")
 
 
-def learning_rate_scale(step, steps, warmup_steps):
-    if step < warmup_steps:
-        return (step + 1) / max(1, warmup_steps)
-    return max(0.0, (steps - step) / max(1, steps - warmup_steps))
+def sample_puzzles(puzzles, count, rng):
+    if count > len(puzzles):
+        return rng.choices(puzzles, k=count)
+    return rng.sample(puzzles, count)
 
 
-def sample_problems(rows, count, rng):
-    if count > len(rows):
-        raise ValueError("Not enough problems for the requested generation size")
-    return rng.sample(rows, count)
+def generation_policy_id(config, generation):
+    """Prompt label for the policy that continues an episode in this generation."""
+    base = f"24game:seed{config['seed']}"
+    if generation == 0 and config["init_policy"] == "solver_mix" and config["init_solver_mix"] > 0:
+        return f"{base}:solver{config['init_solver_mix']:g}:g0"
+    return f"{base}:g{generation}"
 
 
-def rollout_seeds(problems, config, generation, R):
-    return {
-        (problem["id"], repeat): stream_seed(
-            config["seed"], generation, problem["id"], repeat
-        )
-        for problem in problems
-        for repeat in range(R)
-    }
+def generation_config(config, generation):
+    """The frozen policy of one generation: its prompt label and its controller mix."""
+    mix = config["init_solver_mix"] if (
+        generation == 0 and config["init_policy"] == "solver_mix"
+    ) else 0.0
+    return dict(config, policy_id=generation_policy_id(config, generation), solver_mix=mix)
 
 
-def evaluate_policy(model, tokenizer, config, problems, generation, mode="greedy"):
-    seeds = [
-        stream_seed(config["seed"], "validation", generation, problem["id"])
-        for problem in problems
-    ]
-    records = rollout_batch(model, tokenizer, problems, config, seeds, mode)
+def evaluate_policy(model, tokenizer, puzzles, config, mode="greedy", oracle=None):
+    """Roll out puzzles under the current policy and score the visited rows."""
+    ordered, seeds = [], []
+    for index, puzzle in enumerate(puzzles):
+        ordered.append(puzzle)
+        seeds.append(stream_seed(config["seed"], "eval", config["policy_id"], puzzle["puzzle_id"], index))
+    records = rollout_batch(model, tokenizer, ordered, config, seeds, mode=mode)
     rows = []
     for record in records:
-        problem = next(item for item in problems if item["id"] == record["problem_id"])
+        outcome = "yes" if record["solved"] else "no"
         for step in record["steps"]:
-            candidate = next(
-                item for item in step["state"].candidates() if item["key"] == step["chosen"]
-            )
             rows.append(
-                question_row(step["state"], candidate, config["policy_id"])
-                | dict(
-                    observed_outcome="yes" if record["correct"] else "no",
-                    problem_id=record["problem_id"],
-                )
+                question_row(step["state"], step["action"], config["policy_id"])
+                | dict(observed_outcome=outcome, controller=step["controller"])
             )
     metrics = dict(
-        problems=len(problems),
-        final_answer_accuracy=rate(sum(r["correct"] for r in records), len(records)),
-        all_actions_correct_rate=rate(
-            sum(all(step["kind"] == "STOP" for step in r["steps"]) for r in records),
-            len(records),
-        ),
-        forced_stop_rate=rate(sum(r["forced"] for r in records), len(records)),
-        mean_steps=float(np.mean([len(r["steps"]) for r in records])),
+        puzzles=len(puzzles),
         mode=mode,
+        solved=sum(record["solved"] for record in records),
+        solved_rate=rate(sum(record["solved"] for record in records), len(records)),
+        mean_steps=float(np.mean([len(record["steps"]) for record in records])),
+        mean_action_entropy=float(
+            np.mean([step["entropy"] for record in records for step in record["steps"]])
+        ),
+        mean_p_yes_chosen=float(
+            np.mean([step["p_yes"] for record in records for step in record["steps"]])
+        ),
     )
+    if oracle is not None:
+        first = [record["steps"][0] for record in records if record["steps"]]
+        metrics["first_action_solvable_rate"] = rate(
+            sum(
+                oracle.get((record["puzzle"]["puzzle_id"], 0), {}).get(step["chosen"], False)
+                for record, step in zip(
+                    [record for record in records if record["steps"]], first
+                )
+            ),
+            len(first),
+        )
+        metrics["oracle_states"] = len(first)
     if rows:
         predictions = predict_rows(
             model,
             tokenizer,
             rows,
-            config["inference_questions"],
-            config["max_length"],
-            config["inference_precision"],
+            microbatch=config["inference_questions"],
+            max_length=config["max_length"],
+            precision=config["inference_precision"],
         )
-        metrics.update(observed_metrics(predictions, rows))
-        metrics.update(risk_coverage(predictions, rows))
+        metrics |= observed_metrics(predictions, rows)
+        metrics |= risk_coverage(predictions, rows)
+        if oracle is not None:
+            metrics["oracle_separation"] = oracle_separation(predictions, rows, oracle)
     return records, rows, metrics
 
 
-def step_action_reference(model, tokenizer, config, problem, repeats, generation):
-    """Empirical success rate of every first-step action, by repeated frozen rollouts."""
-    state = State.initial(problem)
-    first = state.candidates()
-    reference, model_probabilities = {}, {}
-    probabilities = score_candidates(model, tokenizer, [(state, first)], config)[0]
-    seeds, problems = [], []
-    for index, candidate in enumerate(first):
-        for repeat in range(repeats):
-            seeds.append(
-                stream_seed(config["seed"], "action-ref", generation, problem["id"], candidate["key"], repeat)
-            )
-            problems.append(problem)
-    records = rollout_batch(model, tokenizer, problems, config, seeds)
-    for index, candidate in enumerate(first):
-        chunk = records[index * repeats : (index + 1) * repeats]
-        reference[candidate["key"]] = rate(sum(r["correct"] for r in chunk), len(chunk))
-        model_probabilities[candidate["key"]] = probabilities[candidate["key"]]
-    return model_probabilities, reference, records
-
-
-def run(config, output, model=None, tokenizer=None, rows=None):
+def run(config, output, model=None, tokenizer=None):
     validate_config(config)
     if model is None:
         require_slurm()
@@ -172,14 +159,13 @@ def run(config, output, model=None, tokenizer=None, rows=None):
     output.mkdir(parents=True, exist_ok=True)
     seed_all(config["seed"])
     data_root = Path(config["data_dir"])
-    if rows is None:
-        rows = load_rows(data_root / "train.jsonl")
-    rows = [row for row in rows if len(row["numbers"]) <= config["max_quantities"]]
-    if not rows:
-        raise ValueError("No problem survives the quantity cap")
-    rl_rows, validation_rows = split_rows(
-        rows, config["validation_fraction"], config["split_seed"]
-    )
+    manifest = verify_manifest(data_root)
+    train_puzzles = load_puzzles(data_root / "train.jsonl")
+    dev_puzzles = load_puzzles(data_root / "dev.jsonl")[: config["validation_puzzles"]]
+    oracle = load_oracle(data_root)
+    if not train_puzzles or not dev_puzzles:
+        raise ValueError("The generated dataset is empty")
+
     if model is None:
         model = JevModel.load_base(config).float().cuda()
     if tokenizer is None:
@@ -188,7 +174,6 @@ def run(config, output, model=None, tokenizer=None, rows=None):
     if device.type == "cuda":
         require_slurm()
     config = dict(config)
-    config["policy_id"] = f"jevmath:seed{config['seed']}"
     optimizer = torch.optim.AdamW(
         [
             dict(params=model.backbone.parameters(), lr=config["backbone_lr"]),
@@ -201,21 +186,16 @@ def run(config, output, model=None, tokenizer=None, rows=None):
     scheduler = torch.optim.lr_scheduler.LambdaLR(
         optimizer, lambda step: learning_rate_scale(step, total_steps, config["warmup_steps"])
     )
-    validation_problems = validation_rows[: config["validation_problems"]]
     save_json(
         output / "resolved_config.json",
         dict(
             config=config,
-            data_manifest=(
-                json.loads((data_root / "manifest.json").read_text())
-                if (data_root / "manifest.json").exists()
-                else None
-            ),
-            rl_train_problems=len(rl_rows),
-            validation_problems=len(validation_rows),
-            git_commit=subprocess.check_output(
-                ["git", "rev-parse", "HEAD"], text=True
-            ).strip(),
+            manifest=manifest,
+            train_puzzles=len(train_puzzles),
+            dev_puzzles=len(dev_puzzles),
+            git_commit=subprocess.run(
+                ["git", "rev-parse", "HEAD"], text=True, capture_output=True
+            ).stdout.strip(),
         ),
     )
     (output / "resolved_config.yaml").write_text(yaml.safe_dump(config))
@@ -227,63 +207,34 @@ def run(config, output, model=None, tokenizer=None, rows=None):
         for generation in range(config["generations"]):
             folder = output / f"generation_{generation:03d}"
             folder.mkdir()
-            generation_config = dict(
-                config, policy_id=f"{config['policy_id']}:g{generation}"
-            )
-            rng = random.Random(stream_seed(config["seed"], "sample", generation))
-            problems = sample_problems(
-                rl_rows, config["problems_per_generation"], rng
-            )
-            seeds = rollout_seeds(
-                problems, generation_config, generation, config["rollouts_per_problem"]
-            )
-            collect_started = time.monotonic()
-            records, training_rows = collect(
+            generation_started = time.monotonic()
+            frozen = generation_config(config, generation)
+            rng = random.Random(stream_seed(config["seed"], "puzzles", generation))
+            puzzles = sample_puzzles(train_puzzles, config["puzzles_per_generation"], rng)
+            records, rows, rollout_metrics = collect(
                 model,
                 tokenizer,
-                problems,
-                generation_config,
-                seeds,
+                puzzles,
+                frozen,
+                generation,
                 mode=config["rollout_mode"],
             )
-            collect_seconds = time.monotonic() - collect_started
-            if not training_rows:
-                raise RuntimeError("Generation produced no training rows")
             write_jsonl(folder / "trajectories.jsonl", [record_json(r) for r in records])
-            write_jsonl(folder / "rows.jsonl", training_rows)
-            rollout_metrics = dict(
-                generation=generation,
-                problems=len(problems),
-                rollouts=len(records),
-                training_rows=len(training_rows),
-                final_answer_accuracy=rate(
-                    sum(r["correct"] for r in records), len(records)
-                ),
-                forced_stop_rate=rate(sum(r["forced"] for r in records), len(records)),
-                mean_steps=float(np.mean([len(r["steps"]) for r in records])),
-                mean_action_entropy=float(
-                    np.mean([step["entropy"] for r in records for step in r["steps"]])
-                ),
-                collect_seconds=collect_seconds,
-            )
+            write_jsonl(folder / "rows.jsonl", rows)
             save_json(folder / "rollout_metrics.json", rollout_metrics)
+            if not rows:
+                raise RuntimeError("Generation produced no training rows")
             batch_rng = random.Random(stream_seed(config["seed"], "batch", generation))
             step_records = []
             for step in range(config["steps_per_generation"]):
                 batch_rows = [
-                    training_rows[index]
+                    rows[index]
                     for index in batch_rng.choices(
-                        range(len(training_rows)), k=config["effective_batch"]
+                        range(len(rows)), k=config["effective_batch"]
                     )
                 ]
                 record, micro = optimization_step(
-                    model,
-                    tokenizer,
-                    batch_rows,
-                    optimizer,
-                    scheduler,
-                    config,
-                    micro,
+                    model, tokenizer, batch_rows, optimizer, scheduler, config, micro
                 )
                 record["step"] = generation * config["steps_per_generation"] + step
                 record["generation"] = generation
@@ -291,53 +242,36 @@ def run(config, output, model=None, tokenizer=None, rows=None):
                 log.write(json.dumps(record) + "\n")
                 log.flush()
                 print(json.dumps(record), flush=True)
-            validation_records, validation_rows_used, validation_metrics = evaluate_policy(
-                model,
-                tokenizer,
-                generation_config,
-                validation_problems,
-                generation,
-                mode="greedy",
+            dev_records, dev_rows, dev_metrics = evaluate_policy(
+                model, tokenizer, dev_puzzles, frozen, mode="greedy", oracle=oracle
             )
-            action_preview = None
-            if config["action_reference_problems"] and validation_problems:
-                model_probabilities, reference, _ = step_action_reference(
-                    model,
-                    tokenizer,
-                    generation_config,
-                    validation_problems[0],
-                    config["action_reference_repeats"],
-                    generation,
-                )
-                action_preview = action_ranking([model_probabilities], [reference])
+            write_jsonl(folder / "dev_rows.jsonl", dev_rows)
+            save_json(folder / "dev_metrics.json", dev_metrics)
+            plot_reliability(dev_metrics, f"{output.name}_gen{generation:03d}")
             summary = dict(
                 generation=generation,
-                policy_id=generation_config["policy_id"],
+                policy_id=frozen["policy_id"],
+                solver_mix=frozen["solver_mix"],
                 rollout=rollout_metrics,
-                validation={k: v for k, v in validation_metrics.items() if k != "events"},
-                action_ranking=action_preview,
-                mean_loss=float(np.mean([r["loss"] for r in step_records])),
+                dev={key: value for key, value in dev_metrics.items() if key != "events"},
+                mean_loss=float(np.mean([record["loss"] for record in step_records])),
                 mean_gradient_norm=float(
-                    np.mean([r["gradient_norm"] for r in step_records])
+                    np.mean([record["gradient_norm"] for record in step_records])
                 ),
-                seconds=time.monotonic() - started,
-            )
-            write_jsonl(folder / "validation_rows.jsonl", validation_rows_used)
-            save_json(folder / "validation_metrics.json", summary["validation"])
-            plot_reliability(
-                validation_metrics, f"{output.name}_gen{generation:03d}"
+                generation_seconds=time.monotonic() - generation_started,
+                total_seconds=time.monotonic() - started,
             )
             summaries.append(summary)
             save_json(output / "generations.json", summaries)
             atomic_checkpoint(
                 output / "checkpoint.pt",
                 model,
-                config,
+                dict(config, policy_id=frozen["policy_id"]),
                 optimizer=optimizer.state_dict(),
                 scheduler=scheduler.state_dict(),
                 step=(generation + 1) * config["steps_per_generation"],
                 generation=generation,
-                metadata=dict(device=device.type),
+                metadata=dict(device=device.type, dev=summary["dev"]),
             )
             print(json.dumps(dict(generation_complete=summary)), flush=True)
     finally:
@@ -345,34 +279,59 @@ def run(config, output, model=None, tokenizer=None, rows=None):
     save_json(
         output / "summary.json",
         dict(
-            generations=summaries,
-            training_seconds=time.monotonic() - started,
-            peak_gpu_gib=torch.cuda.max_memory_allocated() / 2**30
-            if device.type == "cuda"
-            else 0.0,
+            generations=len(summaries),
+            train_puzzles=len(train_puzzles),
+            dev_puzzles=len(dev_puzzles),
+            final_dev=summaries[-1]["dev"] if summaries else None,
+            best_dev_solved_rate=max(
+                (summary["dev"]["solved_rate"] for summary in summaries), default=None
+            ),
+            seconds=time.monotonic() - started,
         ),
     )
     return summaries
 
 
+def learning_rate_scale(step, total_steps, warmup_steps):
+    if step < warmup_steps:
+        return (step + 1) / warmup_steps
+    remaining = max(0, total_steps - step)
+    return remaining / max(1, total_steps - warmup_steps)
+
+
 def evaluate_test(run, model=None, tokenizer=None):
-    """Final evaluation of a trained checkpoint on the official GSM8K test split."""
+    """Final evaluation on the test split and the unsolvable robustness set."""
     require_slurm()
     output = Path(run)
     model, saved = load_checkpoint(output / "checkpoint.pt")
     config = dict(saved["config"])
     tokenizer = tokenizer if tokenizer is not None else load_tokenizer(config["base_model"])
-    problems = load_rows(Path(config["data_dir"]) / "test.jsonl")
-    picks = random.Random(config["seed"]).sample(
-        problems, min(config["test_problems"], len(problems))
-    )
-    records, rows, metrics = evaluate_policy(
-        model, tokenizer, config, picks, generation=999, mode="greedy"
-    )
-    write_jsonl(output / "test_trajectories.jsonl", [record_json(r) for r in records])
-    write_jsonl(output / "test_rows.jsonl", rows)
-    save_json(output / "test_metrics.json", metrics)
-    return metrics
+    data_root = Path(config["data_dir"])
+    oracle = load_oracle(data_root)
+    report = {}
+    for name, filename, limit in (
+        ("test", "test.jsonl", config["test_puzzles"]),
+        ("unsolvable", "unsolvable.jsonl", None),
+    ):
+        puzzles = load_puzzles(data_root / filename)
+        if limit is not None:
+            puzzles = puzzles[:limit]
+        records, rows, metrics = evaluate_policy(
+            model, tokenizer, puzzles, config, mode="greedy", oracle=oracle
+        )
+        metrics["reached_target_rate"] = rate(
+            sum(record["solved"] for record in records), len(records)
+        )
+        metrics["solver_step_share"] = rate(
+            sum(step["controller"] == "solver" for record in records for step in record["steps"]),
+            sum(len(record["steps"]) for record in records),
+        )
+        write_jsonl(output / f"{name}_trajectories.jsonl", [record_json(r) for r in records])
+        write_jsonl(output / f"{name}_rows.jsonl", rows)
+        save_json(output / f"{name}_metrics.json", metrics)
+        report[name] = {key: value for key, value in metrics.items() if key != "events"}
+    save_json(output / "test_report.json", report)
+    return report
 
 
 def arguments():
@@ -381,7 +340,7 @@ def arguments():
     parser.add_argument("--model-config", default="configs/model.yaml")
     parser.add_argument("--set", action="append", default=[], metavar="KEY=YAML_VALUE")
     parser.add_argument("--output", required=True)
-    parser.add_argument("--test", action="store_true", help="evaluate the test split")
+    parser.add_argument("--test", action="store_true", help="evaluate the test splits")
     args = parser.parse_args()
     config = load_config(args.model_config) | load_config(args.config)
     for item in args.set:

@@ -40,3 +40,11 @@ def seed_all(seed):
 
 def rate(numerator, denominator):
     return float(numerator) / denominator if denominator else None
+
+
+def stream_seed(seed, *parts):
+    """Deterministic 63-bit seed for one stream of a run."""
+    message = ":".join(map(str, (seed, *parts)))
+    return int.from_bytes(hashlib.sha256(message.encode()).digest()[:8], "big") % (
+        2**63 - 1
+    )

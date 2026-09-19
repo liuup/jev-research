@@ -1,37 +1,34 @@
-# Generation-wise online RLCD training on GSM8K train prompts.
-# Rollout cost grows with problems x rollouts x max_steps x candidates per state, so
-# scale these knobs only after checking the measured throughput in the smoke run.
+# Generation-wise online RLCD on the 24 game.
+# Cost model: one generation scores puzzles x rollouts x 3 states x actions, so
+# puzzles_per_generation and rollouts_per_puzzle set the wall clock of a generation.
 mode: online
 seed: 17
-data_dir: data/gsm8k
+data_dir: data/24game
 objective: paired_pg
 baseline: conditional
 reward_samples: 32
-generations: 20
-problems_per_generation: 3000
-rollouts_per_problem: 4
-max_steps: 8
-max_quantities: 6
-steps_per_generation: 200
-# Measured on the RTX 5090 (scripts/benchmark_batches.py): training throughput peaks at
-# microbatch 16-32 (52 rows/s, 7.0-8.3 GiB) with gradient checkpointing. Dropping
-# checkpointing reaches 63 rows/s but needs 23.4 GiB at microbatch 16 and fails at 32.
+# Measured (scripts/benchmark_batches.py, bf16): collection scores ~430 candidate
+# questions/s and ~22 states/s, so one generation of 954 puzzles x 4 rollouts x 3 steps
+# costs about 9 minutes; training runs at ~110 rows/s, so 300 steps cost about 3 minutes.
+generations: 30
+puzzles_per_generation: 954
+rollouts_per_puzzle: 4
+steps_per_generation: 300
 effective_batch: 64
 microbatch: 32
 backbone_lr: 0.00002
 head_lr: 0.0002
 weight_decay: 0.01
 warmup_steps: 20
-eval_every: 50
-checkpoint_every: 1
-validation_fraction: 0.1
-split_seed: 27000000
-validation_problems: 128
-test_problems: 1319
-# Rollout scoring: throughput plateaus near 107k tokens/s from 16 questions per forward
-# upward, so small forwards win on memory (16 questions = 1.9 GiB, 512 = 20.5 GiB).
-inference_questions: 16
-temperature: 1.0
+validation_puzzles: 204
+test_puzzles: 204
+# pi0 needs a moderate success rate, so half of the first generation's continuation
+# steps are taken by the puzzle solver instead of the untrained model.
+init_policy: solver_mix
+init_solver_mix: 0.5
 rollout_mode: sample
-action_reference_problems: 1
-action_reference_repeats: 2
+# 32 questions per forward sits on the measured plateau (507 q/s against 499 q/s at 16)
+# while halving the number of forward calls.
+inference_questions: 32
+temperature: 1.0
+max_length: 256

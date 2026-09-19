@@ -1,112 +1,195 @@
-# Jev-style decision model for GSM8K reasoning steps
+# 24 点 Online RLCD
 
-每一步不是生成整条思维链：模型在一个**结构化候选操作**集合上打分，输出
-`P(最终答案正确 | s_t, a_t, pi)`。计算器执行具体运算，环境推进到下一个 reasoning state。
+用 24 点游戏做「决策模型 + 在线 RLCD」实验：模型对每一步的每一个合法动作回答一个
+yes/no 问题——**「现在执行这个动作，之后继续由冻结策略接管，最后的值会等于 24 吗？」**——
+计算器精确执行每一步运算，标签来自真实 rollout 的观测结果。
 
-## 任务定义
+## 1. 题库
 
-- 初始题目池：GSM8K train prompts（官方 test 只用于最终评估）。
-- reasoning state：当前已知量集合（题目中的数字 + 已经算出的中间量）与已执行步骤。
-- 候选动作：`COMBINE:<op>:<i>:<j>`，`op ∈ {ADD, SUB, MUL, DIV}`；`ADD/MUL` 每个无序对一次，
-  `SUB/DIV` 每个有序对一次，因此两种操作数顺序都可达；另有 `STOP:<i>` 表示把某个量作为最终答案。
-  合并会消耗两个操作数并追加结果，所以从 `n` 个数字开始的 episode 最多 `n-1` 次合并。
-  除零候选在构造阶段就被排除，所有值用 `Fraction` 精确计算。
-- 事件：把最终答案与 GSM8K 的 `#### N` 比较，正确记 `Y=1`。
-- episode 结束条件：模型选择 `STOP`、池子塌缩到只剩一个量、或达到 `max_steps`（此时按确定性规则
-  取最后一个量）。
+枚举所有 4 个整数、取值 1–13、非递减排列的牌组，全部用 `Fraction` 精确计算：
 
-## 模型
+| 项目 | 数量 |
+| --- | --- |
+| 全部牌组 | 1,820 |
+| 可解 | 1,362 |
+| 不可解 | 458 |
 
-`/root/shang/hf-modles/Qwen3.5-0.8B-Base` 的文本骨干，不使用自回归 LM head；新增 Jev 风格的
-candidate scoring head（set attention + 掩码归一化），对每个 `(state, action)` 输出 yes/no 两路
-概率。策略对动作的分布由各动作的 `P(yes)` 归一化得到（`rollout.action_distribution`）。
+每道题都带元数据：
 
-## 训练
-
-每一代先冻结当前 policy，用它在线产生 trajectory（每题 `rollouts_per_problem` 次，
-最多 `max_steps` 步），记录的 `(s_t, a_t)` 用该 trajectory 的最终结果作为观测事件，
-再用 `paired_pg` / `ce` / `brier` 之一训练若干 optimizer steps，得到下一代 policy。
-冻结策略按 generation 切换，避免 calibration target 每步漂移。
-
-目标函数（`objectives.py`）：NanoJev 风格 proper-reward PG，`M=reward_samples` 次抽样，
-
-```text
-R    = (2/M) sum_i 1[A_i=Y] - sum_k c[k](c[k]-1)/(M(M-1)),   E[R] = 2 p.q - ||p||^2
-b_i  = (2/M) p[Y] - 2 sum_{j!=i} p[A_j]/(M(M-1))
-L_PG = -sum_i stop_gradient(r_i - b_i) log p[A_i],           E[grad] = grad ||p-q||^2
+```json
+{"puzzle_id": "3_3_8_8", "numbers": [3, 3, 8, 8], "target": 24, "solvable": true,
+ "solution_count": 1, "example_solution": "8 / (3 - 8 / 3)"}
 ```
 
-`tests/test_objectives.py` 用 float64 枚举验证了这条梯度恒等式。CE 与 Brier 作为对照臂保留，
-用 `configs/ce.yaml`、`configs/brier.yaml` 在同样的数据与调度下运行。
+`solution_count` 统计**去重后的解**（交换律与相同数字造成的重复会合并），`example_solution`
+取最短解；`3_3_8_8` 解唯一，正是 `8 / (3 - 8 / 3)`。
 
-## 数据划分
-
-`data/gsm8k` 由 `scripts/fetch_gsm8k.py` 从官方 `grade-school-math` 仓库下载并记录 sha256。
-train 里 95% 左右的问题（数字个数不超过 `max_quantities`）进入池子，再按 `validation_fraction`
-切成 RL train 与 validation；官方 1,319 道 test 只在 `scripts/evaluate.py` 里使用，不参与任何 rollout。
-
-## 运行
+生成命令（约 7 秒，CPU 即可）：
 
 ```bash
-uv sync
-uv run pytest -q
-uv run python scripts/fetch_gsm8k.py      # CPU，需要网络
-sbatch slurm/smoke.sbatch                  # 一次极小 generation，确认链路
-sbatch slurm/train.sbatch runs/paired_pg configs/train.yaml
-sbatch slurm/train.sbatch runs/ce configs/ce.yaml
-sbatch slurm/train.sbatch runs/brier configs/brier.yaml
+uv run python scripts/build_24game.py --root data/24game --seed 17
 ```
 
-GPU 操作必须在 Slurm 分配内（`runtime.require_slurm`）。rollout 成本随
-`problems_per_generation × rollouts_per_problem × max_steps × 每个状态的候选数` 增长，
-候选数约为 `3m(m-1)+m`（`m` 为当前池子大小），先用 smoke 测出吞吐再放大。
-`uv run python scripts/train.py --test --output runs/paired_pg` 在 test 上做最终评估。
+产物与划分：
 
-## 评估
+```text
+data/24game/
+├── train.jsonl          954 道可解题
+├── dev.jsonl            204 道可解题
+├── test.jsonl           204 道可解题
+├── unsolvable.jsonl     458 道不可解题（稳健性集合，不进入训练）
+├── oracle_actions.jsonl 每道可解题第一步的每个动作，以及执行后是否仍然可解
+└── manifest.json        数字范围、规则、种子、规模、split 哈希、文件哈希、代码版本
+```
 
-每个 generation 结束时在固定 validation 问题上用贪心策略跑一遍，报告：
+防泄漏：分组键是排序后的数字多重集 `canonical_key = tuple(sorted(numbers))`。牌组在生成阶段
+就已经按非递减形式保存，排列被合并，所以一题一组；`split_puzzles` 用固定种子确定性地按
+954/204/204 切开，三个集合互不相交、并集正好是 1,362 道可解题。`verify_manifest` 会在每次
+训练开始时校验行数与文件哈希，数据被改动就直接报错。
 
-- `final_answer_accuracy`：整题最终答案正确的比例。
-- 概率质量：`observed_brier`（向量，等于标量二分类 Brier 的两倍）、`binary_brier`、`observed_nll`、
-  `mean_entropy`、`ece_ge_correct` 与可靠性图（预测 0.8 的 state-action 实际成功率是否接近 80%）。
-- `risk_coverage`：按置信度排序后的准确率曲线与 AURC。
-- `action_ranking`（`action_reference_problems > 0` 时）：把模型对各动作的 `P(yes)` 排名与
-  重复 rollout 得到的经验成功率排名比较，给出一致率与后悔值，这就是 step/action 层面的准确度。
+## 2. 环境
 
-产物：`runs/<name>/generations.json`、`training.jsonl`、`generation_XXX/{trajectories,rows,
-validation_rows}.jsonl`、`generation_XXX/{rollout,validation}_metrics.json`、`checkpoint.pt`、
-`summary.json`。
+状态是**剩余数字的精确有理数多重集**（排序后的 `Fraction` 元组）。一步从两个数里选一对，
+对有序数对施加 `+ - * /`：
 
-## 批大小、显存与吞吐（实测）
+- `+` 和 `*` 只提供一次（交换律），相同数值造成的重复动作按键 `op:left:right` 合并；
+- `-` 和 `/` 两个方向都提供；
+- 除数等于 0 的动作不生成；
+- 事件结束条件只有「剩下一个数」，也就是固定三步运算；
+- **没有 STOP 动作**；
+- 最终值等于 24 记 1，否则记 0。
 
-`uv run python scripts/benchmark_batches.py`（Slurm 作业，结果在 `results/benchmark_batches.json`）
-在 RTX 5090 上测了三类形状：候选打分前向、完整状态打分（含分词）、训练步（含反向与优化器），
-每项假设 26 GiB 的显存预算。模型本身 fp32 占 3 GB，实测峰值远低于卡容量。
+中间结果允许负数与分数，全程 `Fraction`，不做任何浮点近似。`solvable_after`（执行后是否
+仍可解）只用于测试与 oracle 评估，不作为 RLCD 的概率标签。
+
+## 3. 模型输入
+
+一个 `(状态, 动作)` 对应两条候选路径，prompt 形如：
+
+```text
+[STATE]
+Target: 24
+Remaining: 8/3 3 8
+
+Steps already taken:
+1. 8 / 3 = 8/3
+
+FrozenPolicy: 24game:seed17:solver0.5:g0
+
+[ACTION]
+3 - 8/3 = 1/3
+
+[QUESTION]
+If this action is performed now and the frozen policy continues, will the final value equal 24 after 2 more operations?
+
+[OPTIONS]
+YES
+NO
+
+[CANDIDATE]
+YES
+```
+
+模型对每个动作输出 `P(YES)`，控制器取最大者（评估）或按归一化后的 `P(YES)` 采样
+（采集）。prompt 里的 `FrozenPolicy` 标明这批标签是在哪个冻结策略下产生的，训练、dev、
+test 三处使用同一个字符串，避免分布外输入。
+
+## 4. 在线 RLCD 循环
+
+每一代：
+
+1. 冻结当前策略，给它一个 `policy_id`（`24game:seed17:g{generation}`）；
+2. 从 train 里抽 `puzzles_per_generation` 道题，每题跑 `rollouts_per_puzzle` 次 rollout；
+3. 每条 rollout 记录访问过的每个 `(state, action)`，**同一个 `(state, action)` 只保留一次**
+   观测结果（本轮内去重，重复条数计入 `duplicate_rows`）；
+4. 用 paired proper-reward PG 更新模型 `steps_per_generation` 步；
+5. 训练前已经完成全部采集，learner 无法影响自己这一代的标签；
+6. 代末在 dev 上做贪心评估并保存 checkpoint，最后在 test 与不可解题集上做一次终评。
+
+**π0 的设定。** 全随机或完全未训练的策略成功率过低，会让标签几乎全是 `NO`。因此第 0 代用
+`init_policy: solver_mix`：每一步以 `init_solver_mix` 的概率交给求解器（在「执行后仍可解」的
+动作里等概率选一个），否则交给模型。第 1 代起完全由模型自己续玩，`FrozenPolicy` 也随之变成
+`g1`。求解器只在第 0 代以这个方式参与数据生成，之后不再出现。
+
+## 5. 实测性能与超参数
+
+`uv run python scripts/benchmark_batches.py`（Slurm 作业，结果 `results/benchmark_batches.json`）
+在 RTX 5090 上测于真实牌局状态（第一步动作数 10–22）：
 
 | 形状 | 设置 | 峰值显存 | 吞吐 |
 | --- | --- | --- | --- |
-| 候选打分前向 | 16 题/次 | 1.85 GiB | 302 题/s（113k token/s） |
-| 候选打分前向 | 64 题/次 | 3.83 GiB | 199 题/s（108k token/s） |
-| 候选打分前向 | 512 题/次 | 20.52 GiB | 199 题/s（108k token/s） |
-| 完整状态打分 | 16 状态 | 2.04 GiB | 3.3 状态/s（215 题/s） |
-| 训练步（checkpointing 开） | microbatch 16 | 6.99 GiB | 52 行/s |
-| 训练步（checkpointing 开） | microbatch 32 | 8.30 GiB | 52 行/s |
-| 训练步（checkpointing 开） | microbatch 128 | 14.64 GiB | 47 行/s |
-| 训练步（checkpointing 关） | microbatch 16 | 23.41 GiB | 63 行/s |
-| 训练步（checkpointing 关） | microbatch 32 | 越界后回退到 8 | 60 行/s |
+| 候选打分前向 bf16 | 16 / 64 / 512 题每次 | 3.9 / 4.7 / 11.8 GiB | 499 / 513 / 504 题/s |
+| 候选打分前向 fp32 | 16 / 64 / 512 题每次 | 3.3 / 4.7 / 17.4 GiB | 195 / 213 / 209 题/s |
+| 完整状态打分（真实收集路径） | 4 / 24 状态 | 3.94 GiB | 27.4 / 22.2 状态/s |
+| 训练步 | microbatch 4 / 32 / 128 | 14.0 GiB | 42 / 110 / 116 行/s |
 
-token 吞吐从 16 题往后就基本持平（107 到 116k token/s），所以把前向批次开大只增加显存、
-不增加吞吐；`inference_questions: 16` 同时占优。fp32 与 bf16 autocast 的差别不到 2%，
-精度不是显存杠杆。训练侧吞吐在 microbatch 16 到 32 之间达到平台（52 行/s），
-关掉 gradient checkpointing 可以把训练提快 20%，但 microbatch 16 就要 23.4 GiB、
-32 直接越界（`optimization_step` 会自动回退并记录实际的 microbatch），因此默认保持开启。
+结论：
 
-真正决定整体耗时的是收集而不是训练：状态打分约 3.3 状态/s，一代 12,000 条 trajectory
-（每题约 3 步）就是 3.6 万个 state-step，约 3.3 小时；而 200 步训练只要约 4 分钟。
-要缩短一代的时间，先调 `problems_per_generation`、`max_steps`、`max_quantities`，
-而不是继续加大批次。
+- **bf16 比 fp32 快 2.4 倍**，显存相同，因此 `inference_precision: bf16` 成为默认；
+- 前向吞吐从 16 题起就进入平台（499→504 题/s），题数只影响显存，`inference_questions: 32`
+  在平台上同时减少调用次数；
+- 训练显存的地板是 14 GiB（fp32 参数 3 GB + AdamW 状态 6 GB + 梯度 3 GB + 激活），
+  microbatch 从 4 加到 128 都不变，吞吐在 microbatch 16 之后到平台。
 
-按上表把 `microbatch: 32`、`effective_batch: 64`、`inference_questions: 16` 写进
-`configs/train.yaml` 后，`slurm/smoke_tuned.sbatch` 又跑了一次 8 题 × 2 次 rollout 的确认
-generation：4 个训练步全部用 microbatch 32、accum 1，无回退，整轮峰值 13.15 GiB，
-整个过程 29 秒（含模型加载）。显存不是这个任务的约束，32 GB 里有 18 GiB 以上空余。
+按上表，正式配置（`configs/train.yaml`）与预算：
+
+| 阶段 | 量 | 耗时 |
+| --- | --- | --- |
+| 收集 | 954 题 × 4 次 rollout × 3 步 = 11,448 个状态 ≈ 23 万个候选问题 | 约 9 分钟 |
+| 训练 | 300 步 × 64 行 = 19,200 次行前向 | 约 3 分钟 |
+| dev 评估 + checkpoint | 204 题贪心 + 8.6 GB 写盘 | 约 1 分钟 |
+| **每代合计** | | **约 13 分钟** |
+| 30 代 + 终评 | | **约 7 小时** |
+
+## 6. 运行
+
+```bash
+uv run pytest -q                                   # 49 个 CPU 测试
+uv run python scripts/build_24game.py               # 生成题库与 manifest
+uv run python scripts/smoke_test.py                 # CPU 全流程 smoke（tiny 模型）
+sbatch slurm/build.sbatch                           # 需要 Slurm 的等价生成
+sbatch slurm/smoke.sbatch                           # 10 步 GPU smoke（runs/smoke_gpu）
+sbatch slurm/benchmark.sbatch                       # 批大小 / 显存探测
+sbatch slurm/train.sbatch runs/paired_pg configs/train.yaml
+sbatch slurm/train.sbatch runs/ce configs/ce.yaml
+sbatch slurm/train.sbatch runs/brier configs/brier.yaml
+uv run python scripts/evaluate.py --run runs/paired_pg   # 单独跑 test 评估
+```
+
+所有 GPU 工作必须在 Slurm 分配内运行（`runtime.require_slurm`）。
+
+## 7. 产物与指标
+
+```text
+runs/<name>/
+├── resolved_config.{json,yaml}  配置、manifest、题数、git commit
+├── training.jsonl               每一步的 loss、梯度范数、校准诊断
+├── generation_XXX/
+│   ├── trajectories.jsonl       每条轨迹的动作、分布、熵、控制器
+│   ├── rows.jsonl               去重后的训练行（一条一个观测结果）
+│   ├── rollout_metrics.json     成功率、YES 比例、平均 P(YES)、动作熵、solver 占比
+│   ├── dev_rows.jsonl / dev_metrics.json
+├── generations.json / summary.json / checkpoint.pt（8.6 GB，每代覆盖）
+└── test_metrics.json / unsolvable_metrics.json / test_report.json
+```
+
+指标口径：
+
+- `solved_rate`、`first_action_solvable_rate`：贪心成功率，以及第一步是否保持可解（oracle）；
+- `yes_rate`：这批行里观测结果为 YES 的比例；
+- `binary_brier`、`observed_nll`、`ece_ge_correct`、`mean_prediction_entropy`：校准；
+  `observed_brier` 是两类求和的多类 Brier，等于 `binary_brier` 的两倍，报表以 `binary_brier` 为准；
+- `mean_action_entropy`：动作分布的熵（上限是 log 动作数），用来观察策略是否退化；
+- `oracle_separation`：`P(YES)` 在「执行后仍可解」与「死路」两类动作上的均值差，直接衡量排序
+  是否有效；
+- `aurc` / risk-coverage：按置信度排序后的准确率曲线。
+
+## 8. 已知限制
+
+- 458 道不可解题在动作空间内确实无解，模型对它们唯一正确的行为是让 `P(YES)` 保持低位，
+  因此它们只用于稳健性检查，不计入成功率。
+- 第 0 代的续玩策略有一半由求解器完成，π0 的成功率因此偏高；从第 1 代起标签完全来自模型
+  自身策略，跨代比较成功率时要注意这一点。
+- 4 个数字固定三步运算，没有 STOP，所以「最终值」只在轨迹结束时存在，事件定义是
+  「三步之后的值等于 24」，不存在中途报告答案的情形。
+- dev 指标按行聚合，同一条轨迹的多行共享标签，有效样本量接近题数（204）而非行数。

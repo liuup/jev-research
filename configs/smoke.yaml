@@ -1,14 +1,15 @@
-# One tiny generation that exercises collection, both objectives and evaluation.
+# Ten-step smoke run: tiny collection, tiny training, one generation.
 inherit: train.yaml
 generations: 1
-problems_per_generation: 4
-rollouts_per_problem: 2
-max_steps: 3
-steps_per_generation: 2
-effective_batch: 4
-microbatch: 2
+puzzles_per_generation: 16
+rollouts_per_puzzle: 2
+steps_per_generation: 10
+effective_batch: 8
+microbatch: 4
 warmup_steps: 1
-validation_problems: 2
-inference_questions: 4
-max_length: 1024
-action_reference_problems: 0
+validation_puzzles: 8
+test_puzzles: 8
+init_policy: solver_mix
+init_solver_mix: 0.5
+rollout_mode: sample
+max_length: 256

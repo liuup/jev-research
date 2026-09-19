@@ -1,6 +1,11 @@
-"""Candidate prompts and observed-event records for the reasoning environment."""
+"""Candidate prompts for the 24 game decision model.
 
-from .env import SYMBOL
+Every action of a state becomes one question with two candidate paths, ``YES`` and
+``NO``. The question is always the same event: given that this action is taken now and
+the frozen policy keeps playing, does the episode finish on the target?
+"""
+
+from .env import OPERATIONS_PER_EPISODE
 
 SUCCESS_CANDIDATES = ("yes", "no")
 
@@ -8,69 +13,57 @@ SUCCESS_CANDIDATES = ("yes", "no")
 def candidates(row):
     ids = list(row.get("candidate_ids", SUCCESS_CANDIDATES))
     if len(ids) != 2 or set(ids) != set(SUCCESS_CANDIDATES):
-        raise ValueError("Every reasoning candidate needs exactly yes and no")
+        raise ValueError("Every success question needs exactly yes and no")
     return ids
 
 
-def known_quantities(state):
-    return "\n".join(
-        f"{label} = {value}" for value, label in state.quantities
-    )
+def step_text(step):
+    return f"{step['left']} {step['op']} {step['right']} = {step['result']}"
 
 
-def steps_text(state):
-    if not state.steps:
-        return "(none)"
-    return "\n".join(
-        f"{index + 1}. {step['left']} {SYMBOL[step['op']]} {step['right']} = {step['result']}"
-        for index, step in enumerate(state.steps)
-    )
-
-
-def question_row(state, candidate, policy_id, candidate_id="yes"):
-    """One observed-event question for a single (state, candidate action) pair."""
+def question_row(state, action, policy_id, candidate_id="yes"):
+    """One frozen-policy success question for a single ``(state, action)`` pair."""
     if candidate_id not in SUCCESS_CANDIDATES:
         raise ValueError("Unknown success candidate")
     return dict(
-        row_id=state.row["id"],
+        row_id=state.puzzle_id,
+        puzzle_id=state.puzzle_id,
         state_id=state.state_id(),
         depth=state.depth,
-        question=state.question,
-        gold=str(state.gold),
-        pool=[(str(value), label) for value, label in state.quantities],
-        step_history=list(state.steps),
-        action_key=candidate["key"],
-        action_kind=candidate["kind"],
-        action_text=state.describe(candidate),
+        target=str(state.target),
+        remaining=[str(value) for value in state.values],
+        step_history=[step_text(step) for step in state.history],
+        action_key=action["key"],
+        action_text=action_text(state, action),
         policy_id=policy_id,
         candidate_ids=list(SUCCESS_CANDIDATES),
         candidate_id=candidate_id,
     )
 
 
+def action_text(state, action):
+    return f"{action['left']} {action['op']} {action['right']} = {action['value']}"
+
+
 def serialize(row):
-    """Prompt for one candidate path; the question is the frozen-policy success event."""
+    """Prompt for one candidate path of a 24 game action."""
     candidate_id = row["candidate_id"]
     if candidate_id not in candidates(row):
         raise ValueError("Unknown success candidate")
+    history = row["step_history"]
     return (
-        f"[STATE]\nArithmetic word problem:\n{row['question']}\n\n"
-        f"Known quantities:\n"
-        + "\n".join(f"{label} = {value}" for value, label in row["pool"])
-        + f"\n\nSteps already taken:\n"
-        + (
-            "(none)"
-            if not row["step_history"]
-            else "\n".join(
-                f"{index + 1}. {step['left']} {SYMBOL[step['op']]} {step['right']} = {step['result']}"
-                for index, step in enumerate(row["step_history"])
-            )
-        )
-        + f"\n\nFrozenContinuationPolicy: {row['policy_id']}\n\n"
+        f"[STATE]\nTarget: {row['target']}\n"
+        f"Remaining: {' '.join(row['remaining'])}\n\n"
+        "Steps already taken:\n"
+        + ("(none)" if not history else "\n".join(
+            f"{index + 1}. {text}" for index, text in enumerate(history)
+        ))
+        + f"\n\nFrozenPolicy: {row['policy_id']}\n\n"
         f"[ACTION]\n{row['action_text']}\n\n"
-        "[QUESTION]\nIf this action is taken now and the frozen continuation policy is "
-        "followed afterwards, will the reported final answer be correct? Use the "
-        "calculator results shown above.\n\n"
+        "[QUESTION]\nIf this action is performed now and the frozen policy continues, "
+        f"will the final value equal {row['target']} after "
+        f"{OPERATIONS_PER_EPISODE - row['depth']} more "
+        f"{'operation' if OPERATIONS_PER_EPISODE - row['depth'] == 1 else 'operations'}?\n\n"
         "[OPTIONS]\nYES\nNO\n\n"
         f"[CANDIDATE]\n{candidate_id.upper()}"
     )

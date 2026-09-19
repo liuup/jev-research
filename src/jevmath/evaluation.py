@@ -1,4 +1,4 @@
-"""Probability metrics, risk-coverage and step-level action agreement."""
+"""Probability metrics, risk-coverage and oracle separation for the 24 game."""
 
 from contextlib import contextmanager
 from pathlib import Path
@@ -53,7 +53,7 @@ def predict_rows(model, tokenizer, rows, microbatch=16, max_length=1024, precisi
 
 
 def outcome_correct(predictions, rows):
-    """Boolean label of each row and its predicted success probability."""
+    """Predicted success probability of each row and its observed event."""
     yes = np.array(
         [predictions[i, candidates(row).index("yes")] for i, row in enumerate(rows)]
     )
@@ -85,7 +85,7 @@ def reliability(probability, event, bins=10):
 
 
 def observed_metrics(predictions, rows):
-    """Every row needs exactly one observed outcome; MC probabilities never enter."""
+    """Calibration of the frozen-policy event; every row carries one observed outcome."""
     if not rows:
         raise ValueError("Empty evaluation batch")
     yes, event = outcome_correct(predictions, rows)
@@ -98,6 +98,8 @@ def observed_metrics(predictions, rows):
     )
     return dict(
         questions=len(rows),
+        rows_with_yes=float(event.sum()),
+        yes_rate=float(event.mean()),
         top1_accuracy=float((predictions.argmax(-1) == observed_index).mean()),
         observed_nll=float(
             -(
@@ -108,10 +110,13 @@ def observed_metrics(predictions, rows):
         observed_brier=float(((predictions - one_hot) ** 2).sum(-1).mean()),
         binary_brier=float(((yes - event) ** 2).mean()),
         predicted_success_probability=float(yes.mean()),
-        observed_success_rate=float(event.mean()),
-        mean_entropy=float(entropy.mean()),
+        mean_prediction_entropy=float(entropy.mean()),
         ece_ge_correct=ece,
-        events={"correct": dict(brier=float(((yes - event) ** 2).mean()), ece=ece, reliability=diagram)},
+        events={
+            "correct": dict(
+                brier=float(((yes - event) ** 2).mean()), ece=ece, reliability=diagram
+            )
+        },
     )
 
 
@@ -125,9 +130,7 @@ def risk_coverage(predictions, rows, points=10):
     curve = []
     for step in range(1, points + 1):
         take = order[: max(1, round(len(order) * step / points))]
-        curve.append(
-            dict(coverage=step / points, accuracy=float(correct[take].mean()))
-        )
+        curve.append(dict(coverage=step / points, accuracy=float(correct[take].mean())))
     risk = 1 - np.array([point["accuracy"] for point in curve])
     return dict(
         curve=curve,
@@ -136,29 +139,31 @@ def risk_coverage(predictions, rows, points=10):
     )
 
 
-def action_ranking(model_probabilities, reference_probabilities):
-    """Step/action agreement between the model and reference success probabilities.
+def oracle_separation(predictions, rows, oracle):
+    """Does the model separate actions that keep the puzzle solvable from dead ones?
 
-    Both inputs are ``{action_key: probability}`` per state. The reference is the
-    empirical success rate of an action measured by repeated rollouts.
+    ``oracle`` maps ``(puzzle_id, depth)`` to ``{action_key: solvable_after}``. Only first
+    step actions are stored, so rows at deeper states are skipped.
     """
-    if len(model_probabilities) != len(reference_probabilities):
-        raise ValueError("Model and reference need the same number of states")
-    agreement, regrets, gaps = [], [], []
-    for model, reference in zip(model_probabilities, reference_probabilities):
-        shared = sorted(set(model) & set(reference))
-        if len(shared) < 2:
+    yes = np.array(
+        [predictions[i, candidates(row).index("yes")] for i, row in enumerate(rows)]
+    )
+    solving, dead = [], []
+    for row, probability in zip(rows, yes):
+        table = oracle.get((row["puzzle_id"], row["depth"]))
+        if not table or row["action_key"] not in table:
             continue
-        best = max(shared, key=reference.__getitem__)
-        chosen = max(shared, key=model.__getitem__)
-        agreement.append(best == chosen)
-        regrets.append(reference[best] - reference[chosen])
-        gaps.append(max(model.values()) - min(model.values()))
+        (solving if table[row["action_key"]] else dead).append(float(probability))
+    separation = None
+    if solving and dead:
+        separation = float(np.mean(solving) - np.mean(dead))
     return dict(
-        states=len(agreement),
-        action_agreement=float(np.mean(agreement)) if agreement else None,
-        action_regret=float(np.mean(regrets)) if regrets else None,
-        mean_model_action_gap=float(np.mean(gaps)) if gaps else None,
+        states_with_oracle=len(solving) + len(dead),
+        solving_actions=len(solving),
+        dead_actions=len(dead),
+        mean_p_yes_solving=float(np.mean(solving)) if solving else None,
+        mean_p_yes_dead=float(np.mean(dead)) if dead else None,
+        separation=separation,
     )
 
 
@@ -169,7 +174,9 @@ def plot_reliability(metrics, name):
     axes = figure.subplots(1, 1)
     rows = [row for row in metrics["events"]["correct"]["reliability"] if row["count"]]
     axes.plot([0, 1], [0, 1], "--", color="gray")
-    axes.plot([row["probability"] for row in rows], [row["frequency"] for row in rows], "o-")
+    axes.plot(
+        [row["probability"] for row in rows], [row["frequency"] for row in rows], "o-"
+    )
     axes.set(
         xlim=(0, 1),
         ylim=(0, 1),

@@ -1,73 +1,86 @@
-"""GPU smoke: model, decision head, one backward pass, then one tiny generation."""
+"""Ten-step smoke run of the whole 24 game loop on CPU with the tiny model.
 
-import importlib.metadata
+Checks the pieces the plan asks for before any GPU work: the generation runs end to end,
+the rows carry exactly one observed outcome, the dev metrics are finite, and the
+artifacts land on disk. Exits non-zero when any check fails.
+"""
+
+import argparse
 import json
-import os
+import shutil
 from pathlib import Path
 
-import torch
-from transformers.models.qwen3_5 import modeling_qwen3_5
-
 from jevmath.config import load_config
-from jevmath.dataset import collate
-from jevmath.env import State
-from jevmath.gsm8k import load_rows
-from jevmath.model import JevModel, load_tokenizer
-from jevmath.objectives import loss
-from jevmath.rollout import score_candidates
-from jevmath.serialization import question_row
-from jevmath.trainer import run
-from jevmath.utils import save_json, seed_all
+from jevmath.puzzles import verify_manifest
+from jevmath.tiny import tiny_model_and_tokenizer
+from jevmath.trainer import run, validate_config
+
+CHECKS = (
+    "puzzles",
+    "rollouts",
+    "training_rows",
+    "solved_rate",
+    "row_yes_rate",
+    "mean_p_yes",
+    "mean_action_entropy",
+    "collect_seconds",
+)
+
+
+def smoke(root="runs/smoke", data_dir="data/24game", generations=1):
+    manifest = verify_manifest(data_dir)
+    config = load_config("configs/model.yaml") | load_config("configs/smoke.yaml")
+    config = dict(config, data_dir=data_dir, generations=generations)
+    validate_config(config)
+    model, tokenizer = tiny_model_and_tokenizer()
+    output = Path(root)
+    if output.exists():
+        shutil.rmtree(output)
+    summaries = run(config, output, model=model, tokenizer=tokenizer)
+    assert len(summaries) == generations, summaries
+    report = dict(manifest=manifest["counts"], generations=[])
+    for summary in summaries:
+        rollout = summary["rollout"]
+        for key in CHECKS:
+            assert key in rollout, f"rollout metrics missing {key}"
+        assert rollout["training_rows"] > 0, rollout
+        dev = summary["dev"]
+        for key in (
+            "solved_rate",
+            "binary_brier",
+            "observed_nll",
+            "ece_ge_correct",
+            "mean_prediction_entropy",
+            "oracle_separation",
+        ):
+            assert key in dev, f"dev metrics missing {key}"
+        assert 0.0 <= dev["solved_rate"] <= 1.0
+        assert dev["binary_brier"] >= 0.0
+        report["generations"].append(dict(rollout=rollout, dev=dev))
+    rows = [
+        json.loads(line)
+        for line in (output / "generation_000" / "rows.jsonl").read_text().splitlines()
+    ]
+    assert rows, "no training rows written"
+    assert all(row["observed_outcome"] in ("yes", "no") for row in rows), rows[0]
+    assert len({(row["state_id"], row["action_key"]) for row in rows}) == len(rows), (
+        "training rows must be unique per (state, action)"
+    )
+    assert (output / "checkpoint.pt").exists(), "no checkpoint"
+    assert (output / "summary.json").exists(), "no summary"
+    report["rows"] = len(rows)
+    report["checkpoint_bytes"] = (output / "checkpoint.pt").stat().st_size
+    return report
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--root", default="runs/smoke")
+    parser.add_argument("--data-dir", default="data/24game")
+    parser.add_argument("--generations", type=int, default=1)
+    args = parser.parse_args()
+    print(json.dumps(smoke(args.root, args.data_dir, args.generations), indent=2, default=str))
+
 
 if __name__ == "__main__":
-    assert os.environ.get("SLURM_JOB_ID"), "GPU work must run under Slurm"
-    torch.set_num_threads(4)
-    assert modeling_qwen3_5.is_fast_path_available
-    config = load_config("configs/model.yaml") | load_config("configs/smoke.yaml")
-    config["policy_id"] = f"smoke:seed{config['seed']}"
-    seed_all(config["seed"])
-    torch.cuda.reset_peak_memory_stats()
-    model = JevModel.load_base(config).cuda().train()
-    names = list(dict(model.named_parameters()))
-    assert not any("visual" in name or "lm_head" in name for name in names)
-    assert all(parameter.requires_grad for parameter in model.backbone.parameters())
-    tokenizer = load_tokenizer(config["base_model"])
-
-    rows = load_rows(Path(config["data_dir"]) / "train.jsonl")
-    state = State.initial(rows[0])
-    candidates = state.candidates()
-    probabilities = score_candidates(model, tokenizer, [(state, candidates)], config)[0]
-    assert len(probabilities) == len(candidates)
-    assert all(0.0 <= value <= 1.0 for value in probabilities.values())
-
-    probe = question_row(state, candidates[0], "smoke") | dict(observed_outcome="yes")
-    batch = collate([probe], tokenizer, config["max_length"])
-    with torch.autocast("cuda", dtype=torch.bfloat16):
-        logp = model(batch)
-    torch.testing.assert_close(
-        logp.exp().sum(-1), torch.ones(len(batch["state_ids"]), device="cuda")
-    )
-    loss(logp, batch["targets"].cuda(), "ce").backward()
-    for name, module in (("backbone", model.backbone), ("head", model.head)):
-        missing = [key for key, value in module.named_parameters() if value.grad is None]
-        assert not missing, (name, missing[:5])
-        assert all(torch.isfinite(parameter.grad).all() for parameter in module.parameters())
-    model.zero_grad(set_to_none=True)
-    torch.cuda.empty_cache()
-
-    summary = run(config, "runs/smoke")
-    report = dict(
-        success=True,
-        candidates=len(candidates),
-        first_probabilities=list(probabilities.items())[:5],
-        peak_gpu_gib=torch.cuda.max_memory_allocated() / 2**30,
-        text_parameters=sum(p.numel() for p in model.backbone.parameters()),
-        head_parameters=sum(p.numel() for p in model.head.parameters()),
-        flash_linear_attention_version=importlib.metadata.version(
-            "flash-linear-attention"
-        ),
-        causal_conv1d_version=importlib.metadata.version("causal-conv1d"),
-        generations=summary,
-    )
-    save_json("results/gpu_smoke.json", report)
-    print(json.dumps(report, default=str), flush=True)
+    main()

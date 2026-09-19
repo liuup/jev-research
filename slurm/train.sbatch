@@ -1,12 +1,10 @@
 #!/usr/bin/env bash
-# One full online RLCD run; the config controls generations and rollout sizes.
-#SBATCH --job-name=jevmath-train
+# One full 24 game RLCD run, then the test evaluation.
+#SBATCH --job-name=24game-train
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=24
 #SBATCH --mem=48G
-#SBATCH --time=120:00:00
-# Measured: one generation is about 3.2 h (collection dominates), so 20 generations
-# plus the test evaluation need well over 48 h. The partition has no time limit.
+#SBATCH --time=48:00:00
 #SBATCH --output=logs/slurm/%x-%j.out
 set -euo pipefail
 source slurm/startup.sh

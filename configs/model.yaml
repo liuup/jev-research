@@ -1,7 +1,8 @@
+# Qwen3.5-0.8B text backbone plus a small attention head over the candidate paths.
 base_model: /root/shang/hf-modles/Qwen3.5-0.8B-Base
-seed: 17
-max_length: 1024
 head_width: 256
 attention_heads: 4
 gradient_checkpointing: true
-inference_precision: fp32
+# Measured on the RTX 5090 (scripts/benchmark_batches.py): bf16 forward scoring runs at
+# ~500 questions/s against ~210 questions/s in fp32, at the same peak memory.
+inference_precision: bf16

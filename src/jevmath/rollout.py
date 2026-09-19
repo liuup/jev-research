@@ -1,8 +1,8 @@
-"""Online rollouts under the frozen policy of the current generation.
+"""Online rollouts of the 24 game under the frozen policy of the current generation.
 
-Every step scores all structured candidates of a state in one batched forward. The
-policy over actions is the normalized per-action success probability, so the same
-forward pass yields both the training signal and the action distribution.
+Each step scores every action of every active puzzle in batched forwards, so one pass
+produces both the training signal and the distribution the action is drawn from. The
+label of a row is the observed event: did that episode finish on the target?
 """
 
 import math
@@ -12,22 +12,23 @@ import numpy as np
 import torch
 
 from .dataset import collate
-from .env import State, forced_stop_value
+from .env import State
 from .evaluation import inference_precision
+from .puzzles import is_solvable
 from .serialization import question_row
+from .utils import stream_seed
 
 
 def score_candidates(model, tokenizer, entries, config):
-    """Per-action success probability for ``(state, candidates)`` entries.
+    """Per-action success probability for ``(state, actions)`` entries.
 
-    Returns one ``{action_key: p_yes}`` mapping per entry, evaluated in batched
-    forwards of complete candidate sets.
+    Returns one ``{action_key: p_yes}`` mapping per entry, in batched forwards.
     """
     rows, owners = [], []
-    for index, (state, candidates) in enumerate(entries):
-        for candidate in candidates:
-            rows.append(question_row(state, candidate, config["policy_id"]))
-            owners.append((index, candidate["key"]))
+    for index, (state, actions) in enumerate(entries):
+        for action in actions:
+            rows.append(question_row(state, action, config["policy_id"]))
+            owners.append((index, action["key"]))
     if not rows:
         return [dict() for _ in entries]
     device = next(model.parameters()).device
@@ -36,7 +37,9 @@ def score_candidates(model, tokenizer, entries, config):
     micro = min(config["inference_questions"], len(rows))
     with torch.no_grad(), inference_precision(config["inference_precision"]):
         for offset in range(0, len(rows), micro):
-            batch = collate(rows[offset : offset + micro], tokenizer, config["max_length"])
+            batch = collate(
+                rows[offset : offset + micro], tokenizer, config["max_length"]
+            )
             with torch.autocast(
                 device.type,
                 dtype=torch.bfloat16,
@@ -50,153 +53,198 @@ def score_candidates(model, tokenizer, entries, config):
     return result
 
 
-def action_distribution(probabilities, candidates, temperature):
+def action_distribution(probabilities, actions, temperature):
     """Normalize per-action success probabilities into a policy over actions."""
     if temperature <= 0:
         raise ValueError("temperature must be positive")
     logits = np.array(
-        [math.log(max(probabilities[candidate["key"]], 1e-30)) for candidate in candidates]
+        [math.log(max(probabilities[action["key"]], 1e-30)) for action in actions]
     )
     logits = logits / temperature
-    weights = np.exp(logits - logits.max())
-    weights = weights / weights.sum()
-    return {
-        candidate["key"]: float(weight)
-        for candidate, weight in zip(candidates, weights)
-    }
+    logits -= logits.max()
+    weights = np.exp(logits)
+    weights /= weights.sum()
+    return {action["key"]: float(weight) for action, weight in zip(actions, weights)}
 
 
-def choose(distribution, candidates, rng, mode):
-    if mode not in ("sample", "greedy"):
-        raise ValueError(mode)
+def choose(distribution, actions, rng, mode):
     if mode == "greedy":
-        key = max(distribution, key=distribution.__getitem__)
-    else:
-        keys = [candidate["key"] for candidate in candidates]
-        key = rng.choices(keys, weights=[distribution[k] for k in keys])[0]
-    return next(candidate for candidate in candidates if candidate["key"] == key)
+        best = max(distribution.values())
+        tied = [action for action in actions if distribution[action["key"]] == best]
+        return tied[0] if len(tied) == 1 else rng.choice(tied)
+    if mode != "sample":
+        raise ValueError(f"Unknown rollout mode: {mode}")
+    keys = [action["key"] for action in actions]
+    drawn = rng.choices(keys, weights=[distribution[key] for key in keys])[0]
+    return next(action for action in actions if action["key"] == drawn)
 
 
-def rollout_batch(model, tokenizer, problems, config, seeds, mode="sample"):
-    """One trajectory per ``(problem, seed)``; all rollouts advance in lockstep.
+def pick_action(state, actions, probabilities, config, rng, mode):
+    """Model policy, optionally mixed with the solver for the initial policy pi0."""
+    distribution = action_distribution(probabilities, actions, config["temperature"])
+    if config.get("solver_mix", 0.0) > 0.0 and rng.random() < config["solver_mix"]:
+        solving = [
+            action
+            for action in actions
+            if is_solvable(action["remaining"], state.target)
+        ]
+        if solving:
+            return rng.choice(solving), distribution, "solver"
+    return choose(distribution, actions, rng, mode), distribution, "model"
 
-    Returns a list of records with the chosen actions, the distributions they were drawn
-    from, the reported final answer and whether it matches the gold answer.
-    """
-    if len(problems) != len(seeds):
+
+def rollout_batch(model, tokenizer, puzzles, config, seeds, mode="sample"):
+    """One episode per ``(puzzle, seed)``; all episodes advance in lockstep."""
+    if len(puzzles) != len(seeds):
         raise ValueError("Every rollout needs one seed")
-    states = [State.initial(row) for row in problems]
+    states = [State.initial(puzzle) for puzzle in puzzles]
     rngs = [random.Random(seed) for seed in seeds]
-    records = [dict(steps=[], forced=False, answer=None) for _ in states]
+    records = [
+        dict(puzzle=puzzle, steps=[], solved=False, answer=None) for puzzle in puzzles
+    ]
     active = list(range(len(states)))
-    step_index = 0
     while active:
         entries, choices = [], []
         for index in active:
             state = states[index]
-            candidates = state.candidates()
-            if len(state.quantities) == 1 or state.depth >= config["max_steps"]:
-                records[index]["answer"] = forced_stop_value(state)
-                records[index]["forced"] = True
+            if state.finished:
+                records[index]["answer"] = str(state.current)
+                records[index]["solved"] = bool(state.solved)
                 continue
-            entries.append((state, candidates))
+            entries.append((state, state.actions()))
             choices.append(index)
+        active = [index for index in active if not states[index].finished]
         if not entries:
-            active = [index for index in active if records[index]["answer"] is None]
             continue
         probabilities = score_candidates(model, tokenizer, entries, config)
-        advanced = []
         for slot, index in enumerate(choices):
-            state, candidates = entries[slot]
-            distribution = action_distribution(
-                probabilities[slot], candidates, config["temperature"]
+            state, actions = entries[slot]
+            action, distribution, controller = pick_action(
+                state, actions, probabilities[slot], config, rngs[index], mode
             )
-            candidate = choose(distribution, candidates, rngs[index], mode)
             records[index]["steps"].append(
                 dict(
                     state=state,
-                    candidates=candidates,
+                    actions=actions,
                     distribution=distribution,
-                    chosen=candidate["key"],
-                    kind=candidate["kind"],
+                    chosen=action["key"],
+                    action=action,
+                    controller=controller,
                     entropy=float(
                         -sum(p * math.log(max(p, 1e-30)) for p in distribution.values())
                     ),
+                    p_yes=probabilities[slot][action["key"]],
                 )
             )
-            if candidate["kind"] == "STOP":
-                records[index]["answer"] = candidate["value"]
-            else:
-                states[index] = state.combine(candidate)
-                advanced.append(index)
-        active = advanced
-        step_index += 1
-        if step_index > config["max_steps"] + 1:
-            raise RuntimeError("Rollout exceeded its step budget")
-    for index, record in enumerate(records):
-        record["problem_id"] = problems[index]["id"]
-        record["correct"] = record["answer"] == problems[index]["gold"]
-        record["answer"] = str(record["answer"])
-        record["gold"] = str(problems[index]["gold"])
+            states[index] = state.apply(action)
+    for index, state in enumerate(states):
+        if records[index]["answer"] is None:
+            records[index]["answer"] = str(state.current)
+            records[index]["solved"] = bool(state.solved)
     return records
 
 
 def record_json(record):
-    """JSON-safe trajectory summary; the in-memory record keeps its State objects."""
+    """JSON-safe trajectory summary."""
+    puzzle = record["puzzle"]
     return dict(
-        problem_id=record["problem_id"],
-        gold=record["gold"],
+        puzzle_id=puzzle["puzzle_id"],
+        numbers=list(puzzle["numbers"]),
+        target=puzzle["target"],
         answer=record["answer"],
-        correct=record["correct"],
-        forced=record["forced"],
+        solved=record["solved"],
+        controllers=[step["controller"] for step in record["steps"]],
         steps=[
             dict(
-                depth=step["state"].depth,
                 state_id=step["state"].state_id(),
-                pool=[(str(value), label) for value, label in step["state"].quantities],
-                step_history=list(step["state"].steps),
+                depth=step["state"].depth,
+                remaining=[str(value) for value in step["state"].values],
+                step_history=[f"{s['left']} {s['op']} {s['right']} = {s['result']}" for s in step["state"].history],
                 chosen=step["chosen"],
-                kind=step["kind"],
+                action_text=f"{step['action']['left']} {step['action']['op']} "
+                f"{step['action']['right']} = {step['action']['value']}",
+                controller=step["controller"],
                 entropy=step["entropy"],
-                distribution=dict(step["distribution"]),
-                candidates=[candidate["key"] for candidate in step["candidates"]],
+                p_yes=step["p_yes"],
+                distribution=step["distribution"],
             )
             for step in record["steps"]
         ],
     )
 
 
-def trajectory_rows(record, problems, policy_id):
-    """Observed-event rows: the taken action of each step, labelled by the final outcome."""
-    outcome = "yes" if record["correct"] else "no"
-    row = next(item for item in problems if item["id"] == record["problem_id"])
-    rows = []
-    for step in record["steps"]:
-        state = step["state"]
-        candidate = next(
-            item for item in state.candidates() if item["key"] == step["chosen"]
-        )
-        rows.append(
-            question_row(state, candidate, policy_id)
-            | dict(observed_outcome=outcome, problem_id=record["problem_id"])
-        )
-    return rows
-
-
-def collect(model, tokenizer, problems, config, seeds, mode="sample"):
-    """Roll out ``config.rollouts_per_problem`` trajectories for every sampled problem."""
-    grouped = {}
-    for index, problem in enumerate(problems):
-        grouped.setdefault(problem["id"], []).append(index)
-    rollout_problems, rollout_seeds = [], []
-    for problem_id, indices in grouped.items():
-        for repeat in range(config["rollouts_per_problem"]):
-            rollout_problems.append(problems[indices[0]])
-            rollout_seeds.append(seeds[(problem_id, repeat)])
-    records = rollout_batch(
-        model, tokenizer, rollout_problems, config, rollout_seeds, mode
-    )
-    training = []
+def training_rows(records, policy_id):
+    """Deduplicated training rows: one observed outcome per ``(state, action)``."""
+    rows, seen, duplicates = [], set(), 0
     for record in records:
-        training.extend(trajectory_rows(record, problems, config["policy_id"]))
-    return records, training
+        outcome = "yes" if record["solved"] else "no"
+        for step in record["steps"]:
+            key = (step["state"].state_id(), step["chosen"])
+            if key in seen:
+                duplicates += 1
+                continue
+            seen.add(key)
+            row = question_row(
+                step["state"], step["action"], policy_id, candidate_id="yes"
+            )
+            rows.append(
+                row
+                | dict(
+                    observed_outcome=outcome,
+                    controller=step["controller"],
+                )
+            )
+    return rows, duplicates
+
+
+def rollout_seeds(puzzles, config, generation, repeats):
+    """Deterministic seeds for every rollout of this generation."""
+    ordered, seeds = [], []
+    for repeat in range(repeats):
+        for puzzle in puzzles:
+            ordered.append(puzzle)
+            seeds.append(
+                stream_seed(
+                    config["seed"], "rollout", generation, puzzle["puzzle_id"], repeat
+                )
+            )
+    return ordered, seeds
+
+
+def collect(model, tokenizer, puzzles, config, generation, mode="sample"):
+    """Roll out every puzzle ``rollouts_per_puzzle`` times and build training rows."""
+    import time
+
+    repeats = config["rollouts_per_puzzle"]
+    ordered, seeds = rollout_seeds(puzzles, config, generation, repeats)
+    started = time.monotonic()
+    records = rollout_batch(model, tokenizer, ordered, config, seeds, mode=mode)
+    rows, duplicates = training_rows(records, config["policy_id"])
+    metrics = dict(
+        generation=generation,
+        puzzles=len(puzzles),
+        rollouts=len(records),
+        states_visited=sum(len(record["steps"]) for record in records),
+        training_rows=len(rows),
+        duplicate_rows=duplicates,
+        solved_rate=_rate(sum(record["solved"] for record in records), len(records)),
+        row_yes_rate=_rate(
+            sum(row["observed_outcome"] == "yes" for row in rows), len(rows)
+        ),
+        mean_p_yes=float(
+            np.mean([step["p_yes"] for record in records for step in record["steps"]])
+        ),
+        mean_action_entropy=float(
+            np.mean([step["entropy"] for record in records for step in record["steps"]])
+        ),
+        solver_step_share=_rate(
+            sum(step["controller"] == "solver" for record in records for step in record["steps"]),
+            sum(len(record["steps"]) for record in records),
+        ),
+        collect_seconds=time.monotonic() - started,
+    )
+    return records, rows, metrics
+
+
+def _rate(numerator, denominator):
+    return float(numerator) / denominator if denominator else None

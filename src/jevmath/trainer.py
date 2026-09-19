@@ -324,7 +324,9 @@ def run(config, output, model=None, tokenizer=None, rows=None):
             )
             write_jsonl(folder / "validation_rows.jsonl", validation_rows_used)
             save_json(folder / "validation_metrics.json", summary["validation"])
-            plot_reliability(validation_metrics, f"gen{generation:03d}")
+            plot_reliability(
+                validation_metrics, f"{output.name}_gen{generation:03d}"
+            )
             summaries.append(summary)
             save_json(output / "generations.json", summaries)
             atomic_checkpoint(

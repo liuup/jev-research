@@ -1,8 +1,10 @@
+import importlib.metadata
 import json
 import os
 
 import torch
 import yaml
+from transformers.models.qwen3_5 import modeling_qwen3_5
 
 from jev2048.dataset import collate
 from jev2048.env import Game
@@ -13,6 +15,7 @@ from jev2048.utils import save_json, seed_all
 if __name__ == "__main__":
     assert os.environ.get("SLURM_JOB_ID"), "GPU work must run under Slurm"
     torch.set_num_threads(4)
+    assert modeling_qwen3_5.is_fast_path_available
     config = yaml.safe_load(open("configs/model.yaml"))
     print(config, flush=True)
     seed_all(config["seed"])
@@ -46,6 +49,11 @@ if __name__ == "__main__":
         vision_parameters=0,
         vision_excluded=True,
         lm_head_excluded=True,
+        qwen_fast_path_available=modeling_qwen3_5.is_fast_path_available,
+        flash_linear_attention_version=importlib.metadata.version(
+            "flash-linear-attention"
+        ),
+        causal_conv1d_version=importlib.metadata.version("causal-conv1d"),
         probabilities=lp.exp().detach().cpu().tolist(),
     )
     save_json("results/gpu_smoke.json", report)

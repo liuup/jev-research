@@ -41,7 +41,23 @@ def arguments():
     return a, config
 
 
-def evaluate_run(model, tok, config, output):
+def learning_rate_scale(step, steps, warmup_steps):
+    if step < warmup_steps:
+        return (step + 1) / max(1, warmup_steps)
+    return max(0.0, (steps - step) / max(1, steps - warmup_steps))
+
+
+def question_schedule(row_count, steps, effective_batch, seed, global_step_offset=0):
+    required = (global_step_offset + steps) * effective_batch
+    rng = np.random.default_rng(seed)
+    indices = []
+    while len(indices) < required:
+        indices.extend(rng.permutation(row_count).tolist())
+    start = global_step_offset * effective_batch
+    return indices[start:required]
+
+
+def evaluate_run(model, tok, config, output, plot_name=None):
     root = Path(config["data_dir"])
     output = Path(output)
     report = {}
@@ -72,7 +88,7 @@ def evaluate_run(model, tok, config, output):
         )
         if split == "test":
             report.update(metrics)
-            plot_reliability(metrics, output.name)
+            plot_reliability(metrics, plot_name or output.name)
     mcpath = root / "mc_reference.jsonl"
     if mcpath.exists():
         mc_manifest = json.loads((root / "mc_manifest.json").read_text())
@@ -154,20 +170,45 @@ def main():
     output = Path(args.output or f"runs/offline_{c['objective']}_seed{c['seed']}")
     output.mkdir(parents=True, exist_ok=True)
     resume_path = output / "resume.pt"
+    continuation_from = c.get("continuation_from")
     if args.resume:
         if not resume_path.exists():
             raise FileNotFoundError(resume_path)
         model, saved = load_checkpoint(resume_path)
-        start_step = saved["step"]
+        start_phase_step = saved.get("phase_step", saved["step"])
+        global_step_offset = saved.get("global_step_offset", 0)
+        load_optimizer_state = True
+        reset_optimizer_schedule = False
+    elif continuation_from:
+        if any(output.iterdir()):
+            raise FileExistsError(f"Use a fresh run directory: {output}")
+        model, saved = load_checkpoint(continuation_from)
+        start_phase_step = 0
+        global_step_offset = saved["step"]
+        load_optimizer_state = True
+        reset_optimizer_schedule = True
     else:
         if any(output.iterdir()):
             raise FileExistsError(f"Use a fresh run directory: {output}")
         model, saved = load_checkpoint(c["common_init"])
         if saved["kind"] != "common_initialization_no_warmup":
             raise ValueError("All offline objectives require the common initialization")
-        start_step = 0
+        start_phase_step = 0
+        global_step_offset = 0
+        load_optimizer_state = False
+        reset_optimizer_schedule = False
     for key in ("base_model", "head_width", "attention_heads", "seed"):
         assert saved["config"][key] == c[key], key
+    if continuation_from:
+        for key in (
+            "objective",
+            "data_dir",
+            "effective_batch",
+            "max_length",
+            "reward_samples",
+            "baseline",
+        ):
+            assert saved["config"][key] == c[key], key
     tok = load_tokenizer(c["base_model"])
     optimizer = torch.optim.AdamW(
         [
@@ -179,24 +220,39 @@ def main():
     )
 
     def schedule(step):
-        if step < c["warmup_steps"]:
-            return (step + 1) / max(1, c["warmup_steps"])
-        return max(0.0, (c["steps"] - step) / max(1, c["steps"] - c["warmup_steps"]))
+        return learning_rate_scale(step, c["steps"], c["warmup_steps"])
 
+    if load_optimizer_state:
+        optimizer.load_state_dict(saved["optimizer"])
+    resumed_learning_rates = None
+    if args.resume:
+        resumed_learning_rates = [group["lr"] for group in optimizer.param_groups]
+    if reset_optimizer_schedule:
+        for group, learning_rate in zip(
+            optimizer.param_groups, (c["backbone_lr"], c["head_lr"])
+        ):
+            group["lr"] = learning_rate
+            group["initial_lr"] = learning_rate
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, schedule)
     if args.resume:
-        optimizer.load_state_dict(saved["optimizer"])
         scheduler.load_state_dict(saved["scheduler"])
+        for group, learning_rate in zip(
+            optimizer.param_groups, resumed_learning_rates
+        ):
+            group["lr"] = learning_rate
+    if args.resume or continuation_from:
         torch.set_rng_state(saved["torch_rng"])
         torch.cuda.set_rng_state(saved["cuda_rng"])
         random.setstate(saved["python_rng"])
         np.random.set_state(saved["numpy_rng"])
-    del saved
-    rng = np.random.default_rng(c["seed"])
-    indices = []
-    while len(indices) < c["steps"] * c["effective_batch"]:
-        indices.extend(rng.permutation(len(rows)).tolist())
-    indices = indices[: c["steps"] * c["effective_batch"]]
+    parent_step = saved.get("step") if continuation_from and not args.resume else None
+    indices = question_schedule(
+        len(rows),
+        c["steps"],
+        c["effective_batch"],
+        c["seed"],
+        global_step_offset,
+    )
     meta = dict(
         config=c,
         git_commit=subprocess.check_output(
@@ -212,19 +268,73 @@ def main():
             np.array(indices, dtype=np.int64).tobytes()
         ).hexdigest(),
         slurm_job_id=os.environ["SLURM_JOB_ID"],
+        global_step_offset=global_step_offset,
     )
+    if continuation_from:
+        meta.update(
+            continuation_from=str(continuation_from),
+            continuation_sha256=digest(continuation_from),
+            parent_step=parent_step or global_step_offset,
+        )
     if not args.resume:
         save_json(output / "resolved_config.json", meta)
         (output / "resolved_config.yaml").write_text(yaml.safe_dump(c))
+    best_record_path = output / "best_dev.json"
+    if args.resume and best_record_path.exists():
+        best_record = json.loads(best_record_path.read_text())
+    else:
+        best_record = None
+    selection_metric = c.get("selection_metric", "observed_brier")
+    selection_mode = c.get("selection_mode", "min")
+    if selection_mode not in ("min", "max"):
+        raise ValueError("selection_mode must be min or max")
+    del saved
+    track_best = c.get("track_best", True)
+    if continuation_from and not args.resume and track_best:
+        initial_metrics = observed_metrics(
+            predict(
+                model,
+                tok,
+                dev,
+                c["inference_questions"],
+                c["max_length"],
+                c["inference_precision"],
+            ),
+            dev,
+        )
+        best_record = dict(
+            metric=selection_metric,
+            mode=selection_mode,
+            value=float(initial_metrics[selection_metric]),
+            step=global_step_offset,
+            phase_step=0,
+            metrics=initial_metrics,
+        )
+        save_json(output / "dev" / f"step_{global_step_offset:06d}.json", initial_metrics)
+        atomic_checkpoint(
+            output / "best_checkpoint.pt",
+            model,
+            c,
+            kind="best_dev_checkpoint",
+            step=global_step_offset,
+            phase_step=0,
+            global_step_offset=global_step_offset,
+            selection=best_record,
+            metadata=meta,
+        )
+        save_json(best_record_path, best_record)
     torch.cuda.reset_peak_memory_stats()
     start = time.monotonic()
     micro = c["microbatch"]
     with (output / "training.jsonl").open("a" if args.resume else "w") as log:
-        for step in range(start_step, c["steps"]):
+        for phase_step in range(start_phase_step, c["steps"]):
+            global_step = global_step_offset + phase_step + 1
             batch_rows = [
                 rows[i]
                 for i in indices[
-                    step * c["effective_batch"] : (step + 1) * c["effective_batch"]
+                    phase_step
+                    * c["effective_batch"] : (phase_step + 1)
+                    * c["effective_batch"]
                 ]
             ]
             record, micro = optimization_step(
@@ -232,8 +342,12 @@ def main():
             )
             record.pop("step_seconds", None)
             record.pop("questions_per_second", None)
-            record["step"] = step + 1
-            if (step + 1) % c["eval_every"] == 0 or step + 1 == c["steps"]:
+            record["step"] = global_step
+            evaluate = (
+                (phase_step + 1) % c["eval_every"] == 0
+                or phase_step + 1 == c["steps"]
+            )
+            if evaluate:
                 dev_metrics = observed_metrics(
                     predict(
                         model,
@@ -245,23 +359,52 @@ def main():
                     ),
                     dev,
                 )
-                save_json(output / "dev" / f"step_{step + 1:06d}.json", dev_metrics)
+                save_json(output / "dev" / f"step_{global_step:06d}.json", dev_metrics)
                 record["dev"] = {
                     key: value for key, value in dev_metrics.items() if key != "events"
                 }
+                value = float(dev_metrics[selection_metric])
+                improved = best_record is None or (
+                    value < best_record["value"]
+                    if selection_mode == "min"
+                    else value > best_record["value"]
+                )
+                if improved and track_best:
+                    best_record = dict(
+                        metric=selection_metric,
+                        mode=selection_mode,
+                        value=value,
+                        step=global_step,
+                        phase_step=phase_step + 1,
+                        metrics=dev_metrics,
+                    )
+                    atomic_checkpoint(
+                        output / "best_checkpoint.pt",
+                        model,
+                        c,
+                        kind="best_dev_checkpoint",
+                        step=global_step,
+                        phase_step=phase_step + 1,
+                        global_step_offset=global_step_offset,
+                        selection=best_record,
+                        metadata=meta,
+                    )
+                    save_json(best_record_path, best_record)
             log.write(json.dumps(record) + "\n")
             log.flush()
             print(
                 json.dumps({k: v for k, v in record.items() if k != "dev"}), flush=True
             )
-            if (step + 1) % c["checkpoint_every"] == 0:
+            if (phase_step + 1) % c["checkpoint_every"] == 0:
                 atomic_checkpoint(
                     resume_path,
                     model,
                     c,
                     optimizer=optimizer.state_dict(),
                     scheduler=scheduler.state_dict(),
-                    step=step + 1,
+                    step=global_step,
+                    phase_step=phase_step + 1,
+                    global_step_offset=global_step_offset,
                     torch_rng=torch.get_rng_state(),
                     cuda_rng=torch.cuda.get_rng_state(),
                     python_rng=random.getstate(),
@@ -277,19 +420,47 @@ def main():
     )
     save_json(output / "training_stats.json", stats)
     c["microbatch"] = micro
-    checkpoint(
-        output / "checkpoint.pt",
-        model,
-        c,
-        optimizer=optimizer.state_dict(),
-        scheduler=scheduler.state_dict(),
-        step=c["steps"],
-        torch_rng=torch.get_rng_state(),
-        cuda_rng=torch.cuda.get_rng_state(),
-        python_rng=random.getstate(),
-        numpy_rng=np.random.get_state(),
-        metadata=meta,
-    )
+    if c.get("save_final_checkpoint", True):
+        checkpoint(
+            output / "checkpoint.pt",
+            model,
+            c,
+            optimizer=optimizer.state_dict(),
+            scheduler=scheduler.state_dict(),
+            step=global_step_offset + c["steps"],
+            phase_step=c["steps"],
+            global_step_offset=global_step_offset,
+            torch_rng=torch.get_rng_state(),
+            cuda_rng=torch.cuda.get_rng_state(),
+            python_rng=random.getstate(),
+            numpy_rng=np.random.get_state(),
+            metadata=meta,
+        )
     del optimizer
-    metrics = evaluate_run(model, tok, c, output)
-    print(json.dumps(dict(stats=stats, metrics=metrics)), flush=True)
+    if not c.get("evaluate_after_training", True):
+        save_json(output / "selection.json", dict(best_dev=best_record))
+        print(json.dumps(dict(stats=stats, best_dev=best_record)), flush=True)
+        return
+    metrics = evaluate_run(model, tok, c, output, plot_name=output.name)
+    best_metrics = None
+    if c.get("evaluate_best", False) and (output / "best_checkpoint.pt").exists():
+        del model
+        torch.cuda.empty_cache()
+        best_model, _ = load_checkpoint(output / "best_checkpoint.pt")
+        best_metrics = evaluate_run(
+            best_model,
+            tok,
+            c,
+            output / "best_eval",
+            plot_name=f"{output.name}_best",
+        )
+        del best_model
+        torch.cuda.empty_cache()
+    save_json(
+        output / "selection.json",
+        dict(best_dev=best_record, final_metrics=metrics, best_metrics=best_metrics),
+    )
+    print(
+        json.dumps(dict(stats=stats, metrics=metrics, best_metrics=best_metrics)),
+        flush=True,
+    )

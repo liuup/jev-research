@@ -1,0 +1,14 @@
+inherit: train_paired_pg.yaml
+steps: 5000
+backbone_lr: 0.000005
+head_lr: 0.00005
+warmup_steps: 50
+eval_every: 100
+checkpoint_every: 250
+continuation_from: runs/offline_paired_pg_seed17/resume.pt
+selection_metric: observed_brier
+selection_mode: min
+evaluate_best: true
+track_best: true
+save_final_checkpoint: true
+evaluate_after_training: true

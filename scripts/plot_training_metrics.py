@@ -1,4 +1,4 @@
-"""Plot observed NLL and vector Brier curves from an online training run."""
+"""Plot probability-learning curves from an offline or online training run."""
 
 import argparse
 import json
@@ -61,9 +61,9 @@ def metric(row, split, key):
     return row[split][key]
 
 
-def plot_metrics(records, output, smooth):
+def plot_metrics(records, output, smooth, title):
     steps = np.array([row["step"] for row in records])
-    generations = np.array([row["generation"] for row in records])
+    generations = np.array([row.get("generation", 0) for row in records])
     definitions = (
         ("observed_nll", "Observed NLL"),
         ("observed_brier", "Vector Brier score"),
@@ -104,9 +104,7 @@ def plot_metrics(records, output, smooth):
         for axis in axes:
             axis.axvline(steps[index], color="black", linestyle="--", alpha=0.35)
     axes[-1].set_xlabel("Optimizer step")
-    figure.suptitle(
-        f"Online paired-PG probability metrics ({len(records):,} completed steps)"
-    )
+    figure.suptitle(f"{title} ({len(records):,} completed steps)")
     figure.tight_layout()
     output = Path(output)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -122,13 +120,23 @@ def main():
     )
     parser.add_argument("--output", default=None)
     parser.add_argument("--smooth", type=int, default=25)
+    parser.add_argument("--title")
     args = parser.parse_args()
     if args.smooth < 1:
         parser.error("--smooth must be positive")
     run = Path(args.run)
-    output = Path(args.output) if args.output else Path("results/plots") / f"{run.name}_nll_brier.png"
+    output = (
+        Path(args.output)
+        if args.output
+        else Path("results/plots") / f"{run.name}_nll_brier.png"
+    )
     records = read_records(run / "training.jsonl")
-    plot_metrics(records, output, args.smooth)
+    metadata = json.loads((run / "resolved_config.json").read_text())
+    config = metadata["config"]
+    objective = config["objective"].replace("_", "-")
+    mode = config.get("mode", "training").title()
+    title = args.title or f"{mode} {objective} probability metrics"
+    plot_metrics(records, output, args.smooth, title)
     print(json.dumps(dict(output=str(output), steps=len(records), smooth=args.smooth)))
 
 

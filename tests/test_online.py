@@ -89,6 +89,78 @@ def test_evaluation_real_environment_batch_invariance():
     )
 
 
+class SuccessGame:
+    """Stub whose maximum tile doubles after every step."""
+
+    def __init__(self, seed):
+        self.seed = seed
+        self.steps = self.score = 0
+        self.max_tile = 2
+        self.terminal = False
+
+    def step(self, action):
+        self.steps += 1
+        self.max_tile *= 2
+        return True
+
+
+def success_board(seed):
+    return Game(seed, board=((1024, 1024, 0, 0), (0,) * 4, (0,) * 4, (0,) * 4))
+
+
+class LeftPolicy:
+    policy_id = "left"
+
+    def choose_many(self, games):
+        return ["LEFT"] * len(games)
+
+
+def test_play_seeded_stops_at_success_tile():
+    result = play_seeded(LeftPolicy(), [0, 1], 1, success_board, success_tile=2048)
+    assert [r["steps"] for r in result["records"]] == [1, 1]
+    assert [r["max_tile"] for r in result["records"]] == [2048, 2048]
+    assert result["reach_2048"] == 1.0
+    assert (
+        play_seeded(LeftPolicy(), [0, 1], 2, success_board, success_tile=2048)
+        == result
+    )
+    with pytest.raises(ValueError, match="success_tile"):
+        play_seeded(LeftPolicy(), [0], 1, success_board, success_tile=1)
+
+
+def test_play_seeded_success_games_refill_slots():
+    result = play_seeded(RecordingPolicy(), [1, 2, 3], 2, SuccessGame, success_tile=8)
+    assert [r["steps"] for r in result["records"]] == [2, 2, 2]
+    assert [r["max_tile"] for r in result["records"]] == [8, 8, 8]
+    assert result["reach_2048"] == 0.0
+    assert play_seeded(RecordingPolicy(), [1, 2, 3], 1, SuccessGame, success_tile=8) == result
+
+
+def test_frozen_model_policy_carries_reach_2048_task():
+    policy = FrozenModelPolicy(
+        TinyModel(),
+        TinyTokenizer(),
+        dict(
+            policy_id="test",
+            utility="threshold",
+            threshold=2048,
+            task="reach_2048",
+            continuation_policy_id="heuristic:test",
+        ),
+        configuration(),
+    )
+    assert policy.controller.task == "reach_2048"
+    assert policy.controller.continuation_policy_id == "heuristic:test"
+    default = FrozenModelPolicy(
+        TinyModel(),
+        TinyTokenizer(),
+        dict(policy_id="test", utility="log_tile", threshold=2048),
+        configuration(),
+    )
+    assert default.controller.task == "terminal_max_tile"
+    assert default.controller.continuation_policy_id is None
+
+
 def tiny_game(seed):
     return Game(
         seed,

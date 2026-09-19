@@ -8,6 +8,8 @@ head_lr: 0.0002
 weight_decay: 0.01
 warmup_steps: 20
 eval_every: 50
+plot_every_eval: true
+plot_smooth: 10
 checkpoint_every: 50
 eval_questions: 2048
 inference_questions: 16

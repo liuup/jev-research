@@ -20,6 +20,7 @@ from .optimization import optimization_step
 from .runtime import atomic_checkpoint, checkpoint, load_checkpoint, require_slurm
 from .serialization import OUTCOMES as OUTCOME_IDS
 from .serialization import candidates
+from .training_plot import plot_training_run
 from .utils import digest, save_json, seed_all
 
 
@@ -151,6 +152,7 @@ def main():
         "checkpoint_every",
         "eval_questions",
         "inference_questions",
+        "plot_smooth",
     ):
         if not isinstance(c[key], int) or c[key] < 1:
             raise ValueError(f"{key} must be a positive integer")
@@ -407,6 +409,24 @@ def main():
                     save_json(best_record_path, best_record)
             log.write(json.dumps(record) + "\n")
             log.flush()
+            if evaluate and c.get("plot_every_eval", True):
+                try:
+                    plot_result = plot_training_run(
+                        output,
+                        smooth=c["plot_smooth"],
+                    )
+                    print(json.dumps(dict(training_plot=plot_result)), flush=True)
+                except Exception as error:
+                    print(
+                        json.dumps(
+                            dict(
+                                training_plot_error=type(error).__name__,
+                                message=str(error),
+                                step=global_step,
+                            )
+                        ),
+                        flush=True,
+                    )
             print(
                 json.dumps({k: v for k, v in record.items() if k != "dev"}), flush=True
             )

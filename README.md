@@ -18,6 +18,11 @@ sbatch slurm/success_smoke.sbatch
 # GPU 评估和游戏必须放在 Slurm 分配内，使用以下入口
 # uv run python scripts/evaluate.py --run runs/success_paired_pg_smoke_seed17
 # uv run python scripts/play.py --run runs/success_paired_pg_smoke_seed17 --games 10
+# 闭环对局默认一次玩一局；--batch-games 让多局共享一次前向，吞吐显著提高
+# uv run python scripts/play.py --run runs/success_paired_pg_seed17 --games 100 --seed 0 --batch-games 50
+# --controller hybrid 让启发式负责规划，模型只在启发式价值接近的候选里裁决；
+# --judge-delta 是允许放弃的启发式价值，取 0 时模型只在启发式完全平手时发言
+# uv run python scripts/play.py --run runs/success_paired_pg_seed17 --games 100 --seed 0 --batch-games 50 --controller hybrid --judge-delta 0.1
 ```
 
 转换保留所有源游戏 split，每条标签仍来自一次环境反馈；MC 合并后的 YES/NO 分布只用于评估。以下章节保留原七分类实验的复现说明。

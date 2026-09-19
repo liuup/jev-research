@@ -14,6 +14,13 @@ Binary data conversion, training metrics, MC evaluation and success-stopping ful
 uv run python scripts/convert_success_data.py --output data/success_pi0_v1
 uv run python scripts/audit_data.py --data-dir data/success_pi0_v1
 sbatch slurm/success_smoke.sbatch
+# Closed-loop play defaults to one game at a time; --batch-games shares one forward
+# across games and raises throughput substantially.
+# uv run python scripts/play.py --run runs/success_paired_pg_seed17 --games 100 --seed 0 --batch-games 50
+# --controller hybrid lets the heuristic plan and the model judge only near-equal
+# candidates; --judge-delta is the heuristic value the judge may give up (0 keeps
+# every decision the heuristic would have made alone).
+# uv run python scripts/play.py --run runs/success_paired_pg_seed17 --games 100 --seed 0 --batch-games 50 --controller hybrid --judge-delta 0.1
 ```
 
 Conversion refuses existing output directories and preserves source-game splits. Each label remains one observed event; aggregated MC distributions are evaluation-only. The sections below describe the historical seven-class experiment.

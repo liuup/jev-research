@@ -11,10 +11,24 @@ from .env import Game
 from .utils import game_summary
 
 
-def play_seeded(policy, seeds, batch_size=8, game_factory=Game, progress=None):
-    """Refill completed slots immediately; return results in input seed order."""
+def play_seeded(
+    policy, seeds, batch_size=8, game_factory=Game, progress=None, success_tile=None
+):
+    """Refill completed slots immediately; return results in input seed order.
+
+    success_tile stops a game as soon as that tile appears, which is the reach_2048
+    episode rule; None plays every game to its terminal board.
+    """
     if batch_size < 1:
         raise ValueError("batch_size must be positive")
+    if success_tile is not None and success_tile < 2:
+        raise ValueError("success_tile must be at least 2")
+
+    def done(game):
+        return game.terminal or (
+            success_tile is not None and game.max_tile >= success_tile
+        )
+
     seeds = list(seeds)
     finished = [None] * len(seeds)
     active = {}
@@ -36,7 +50,7 @@ def play_seeded(policy, seeds, batch_size=8, game_factory=Game, progress=None):
         previous_completed = completed
         while len(active) < batch_size and next_index < len(seeds):
             game = game_factory(seeds[next_index])
-            if game.terminal:
+            if done(game):
                 finished[next_index] = game
                 completed += 1
             else:
@@ -50,7 +64,7 @@ def play_seeded(policy, seeds, batch_size=8, game_factory=Game, progress=None):
                 game = active[index]
                 if not game.step(action):
                     raise ValueError("Invalid evaluation action")
-                if game.terminal:
+                if done(game):
                     finished[index] = active.pop(index)
                     completed += 1
         now = time.monotonic()

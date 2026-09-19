@@ -19,6 +19,13 @@ def checkpoint(path, model, config, **extra):
     torch.save(dict(model=model.state_dict(), config=config, **extra), path)
 
 
+def atomic_checkpoint(path, model, config, **extra):
+    path = Path(path)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    checkpoint(temporary, model, config, **extra)
+    os.replace(temporary, path)
+
+
 def load_checkpoint(path):
     require_slurm()
     saved = torch.load(path, map_location="cpu", weights_only=False, mmap=True)

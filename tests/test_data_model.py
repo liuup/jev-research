@@ -99,8 +99,8 @@ def test_reference_terminal_continuation():
         state_id="test:1:0",
         observed_outcome="256",
     )
-    a = mc_pair((r, 4, 17))
-    b = mc_pair((r, 4, 17))
+    a = mc_pair((r, 4, 17, "configs/heuristic.yaml"))
+    b = mc_pair((r, 4, 17, "configs/heuristic.yaml"))
     assert a == b and sum(a["counts"]) == 4 and sum(a["q"]) == 1
     assert "observed_outcome" not in a
 
@@ -112,10 +112,10 @@ def test_split_isolation():
 
 
 def test_generated_smoke_split_isolation():
-    if not Path("data/smoke/manifest.json").exists():
+    if not Path("data/offline_smoke/manifest.json").exists():
         pytest.skip("Generate smoke data for artifact audit")
     splits = [
-        read_rows(f"data/smoke/{s}.jsonl")
+        read_rows(f"data/offline_smoke/{s}.jsonl")
         for s in ("train", "dev", "calibration", "test")
     ]
     groups = [set(r["source_game"] for r in rows) for rows in splits]
@@ -126,3 +126,5 @@ def test_generated_smoke_split_isolation():
             actions = [x["action"] for x in rows if x["state_id"] == r["state_id"]]
             assert actions == game.legal_actions
             assert "q" not in r and r["observed_outcome"] in OUTCOMES
+            assert r["terminal_max_tile"] >= max(map(max, r["board"]))
+            assert r["terminal_score"] >= r["score"] and r["rollout_steps"] > 0

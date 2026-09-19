@@ -1,69 +1,50 @@
 [中文](README.md) | English
 
-# 2048 Game with Online Jev (RLCD)
+# Offline Jev / RLCD for 2048
 
-This project reproduces the core idea of Jev and evolves a 2048 agent with RLCD using feedback from the environment.
+This project uses the local `/root/shang/hf-modles/Qwen3.5-0.8B-Base` checkpoint to study Jev-style outcome prediction on a static dataset. It is not an action classifier. For every legal action it separately predicts
 
-By default, it uses the local `/root/shang/hf-modles/Qwen3.5-0.8B-Base` checkpoint and performs full-parameter training of the text backbone and candidate-set scoring head.
+`p(terminal maximum tile | board, first action, frozen heuristic continuation π0)`.
 
-## Online RLCD Workflow
+The output is a complete distribution over `<256, 256, 512, 1024, 2048, 4096, 8192+`. No text is generated. The Qwen text backbone encodes each candidate and a shared set-attention decision head normalizes across candidates. The vision tower is frozen; the text backbone and decision head are fully fine-tuned.
 
-1. The initial controller is a heuristic policy. At generation `t`, the current controller `πt` is frozen.
-2. Board states are explored online using `πt` mixed with 15% random actions. Every legal action is branched independently from each selected state, after which `πt` plays to termination to produce one observed outcome `Y`.
-3. The model updates `p(y | s,a,πt)`. The default objective is paired-PG with 32 predictive-label samples and a detached conditional baseline. CE and Brier objectives are also supported.
-4. The newly trained model is frozen and chooses actions by expected terminal `log2(tile)`. Candidate and incumbent use matching game seeds; promotion requires the configured absolute improvement in mean terminal log-tile.
-5. A generation advances only after promotion. Rejection keeps the current generation, model weights, Adam state, and learning-rate progress. Promotion freezes the new policy, resets the optimizer, and starts fresh feedback collection.
+## Data and leakage prevention
 
-The input includes both the current board and the deterministic afterstate before random tile spawning, but never the terminal label. No pre-generated dataset is required. Heuristic continuation rollouts use asynchronous CPU prefetch; neural continuation and training use the Slurm-managed GPU.
+A fixed behavior policy collects boards from independently seeded games. Every legal first action is branched from the same board, after which the frozen heuristic `π0` plays to termination. Each `(state, action)` stores exactly one observed stochastic terminal event; MC probabilities are never training labels.
 
-The main budgets are in `configs/online.yaml`: `max_policy_generations` limits frozen policy versions, `min/max_optimizer_steps_per_policy` bound updates against one target policy, `promotion_interval_steps` controls promotion checks, and `max_total_optimizer_steps` is the global cap.
-
-## Validation and Launch
+`train/dev/calibration/test` use disjoint source-game seed ranges. All actions from a board and all states from a source game stay in one split. `manifest.json` stores settings, policy/simulator hashes, split counts, and file hashes; `audit_data.py` verifies the isolation. A separate MC reference is sampled from test boards for evaluation only.
 
 ```bash
 uv sync --locked
 uv run pytest -q
-uvx ruff check src scripts tests
-uv run python scripts/validate_online.py
+
+# Generate about 100k/2k/2k/4k questions through Slurm and audit them
+sbatch slurm/generate_data.sbatch data/offline_pi0_v1
+# After data generation, build the evaluation-only MC reference
+sbatch slurm/build_mc_reference.sbatch data/offline_pi0_v1
 ```
 
-The commands below run GPU validation and training. Complete both smoke-test stages and verify their success before launching the main experiment:
+Heuristic benchmark (100 games, seed 17): mean score 15543.88, median 15084, with reach probabilities 0.96/0.72/0.18 for 512/1024/2048. `π0` must not change after data generation.
+
+## Training objectives
+
+- `ce`: negative log likelihood of the observed outcome.
+- `brier`: vector Brier loss against the observed one-hot event.
+- `paired_pg`: RLCD-inspired proper-reward PG with 32 predictive outcome-label samples and a detached conditional baseline. These samples are outcome labels, not 2048 actions.
+
+All objectives use identical data, batch schedule, seed, update count, and `runs/offline_common_init.pt`. The main settings are in `configs/offline.yaml`: 500 steps, effective batch 256, and microbatch 16. Environment feedback for paired-PG is already frozen in the offline dataset; training performs no rollouts.
 
 ```bash
-mkdir -p logs/slurm
-sbatch slurm/smoke_gpu.sbatch
-# After the previous job succeeds:
-sbatch slurm/online_smoke.sbatch
-# After the online smoke test completes:
-uv run python scripts/verify_training_smoke.py --run runs/online_expected_log_tile_smoke
+# GPU work must use Slurm; create the common initialization once
+sbatch slurm/initialize.sbatch
 
-# Main experiment (submit manually only when ready)
-sbatch --job-name=jev-online-pg-seed17 slurm/train.sbatch paired_pg
-# Or launch three independent online objectives:
+# One objective or the matched three-objective comparison
+sbatch --job-name=jev-offline-pg-seed17 slurm/train.sbatch paired_pg
 bash slurm/submit_all.sh
 bash slurm/status.sh
 # bash slurm/cancel.sh JOB_ID [JOB_ID ...]
 ```
 
-Configuration is stored in `configs/online.yaml`. Training initializes from the local base checkpoint and configured seed, or optionally from `initial_checkpoint`. All three objectives begin with the same weights and random seed, but their sampling trajectories may diverge after their online policies diverge. Comparisons should therefore also account for environment interactions and elapsed time.
+`training.jsonl` records loss, gradients, reward/advantage diagnostics, NLL, Brier, entropy, top-1, and predicted distributions, but not per-step timing or GPU memory. `training_stats.json` separately stores total training time and peak memory. Test reports are written under `runs/offline_*_seed17/`; `scripts/summarize.py` creates `results/comparison.{json,csv,md}`.
 
-## Results and Evaluation
-
-Under `runs/online_paired_pg_seed17/`:
-
-- `training.jsonl`: reward, advantage statistics, NLL/Brier, predicted and observed mean log-tile and their aggregate bias, predicted distributions, and environment interaction counts; GPU memory is not recorded here. A single stochastic terminal event does not reveal the true expected log-tile, so misleading per-example MAE is not reported.
-- `generation_XXX/events.jsonl`: the single-outcome environment feedback actually consumed for updates in that generation. This is an audit log, not a pre-generated training dataset.
-- `generation_XXX/checkpoint.pt`: learner weights used by the latest promotion check. Its prediction target is specified by `target_policy.json`.
-- `generation_XXX/metrics.json`: probability metrics, Monte Carlo action-ranking agreement, and utility regret on fixed holdout boards. Labels and MC probabilities are regenerated each generation under that generation's frozen policy.
-- `promotion_step_XXXXXX.json`: each promotion check; `promotion.json` is the latest check. `controller_test.json` is independent and not used for promotion.
-- `active_policy.json`: the policy actually approved to control the game. It may still be the heuristic policy; the latest checkpoint must not automatically be treated as the stronger controller.
-
-```bash
-sbatch slurm/evaluate.sbatch --run runs/online_paired_pg_seed17/generation_000
-sbatch slurm/play.sbatch --run runs/online_paired_pg_seed17 --policy active --games 100 --seed 0
-uv run python scripts/summarize.py
-```
-
-Summary outputs are written to `results/comparison.{csv,json,md}`, with probability metrics and closed-loop scores kept in separate tables. Training, holdout, MC, promotion, and test data use isolated random streams. Holdout boards remain fixed, and MC labels are used for evaluation only.
-
-NLL and Brier are the formal probability metrics for single observed outcomes. Expected-log-tile error is evaluated only on the MC reference by comparing `pᵀu` with `q_hatᵀu`; control quality uses paired-seed closed-loop mean terminal log-tile. Aggregate mean bias diagnoses systematic over- or under-prediction but is not a per-state expected-utility error.
+NLL, Brier, and ECE measure probability quality; top-1 is not calibration. MC probabilities never enter training. Closed-loop game scores are a separate control demonstration and are not calibration evidence under `π0`.

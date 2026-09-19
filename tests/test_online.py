@@ -306,12 +306,10 @@ def test_online_config_requires_no_offline_data():
     ):
         with pytest.raises(ValueError):
             validate_online_config(c | update)
-    for objective in ("ce", "brier", "paired_pg"):
-        c = load_config("configs/model.yaml") | load_config(
-            f"configs/train_{objective}.yaml"
-        )
-        validate_online_config(c)
-        assert c["mode"] == "online" and c["objective"] == objective
+    c = load_config("configs/model.yaml") | load_config("configs/online.yaml")
+    c["objective"] = "paired_pg"
+    validate_online_config(c)
+    assert c["mode"] == "online"
 
 
 def test_two_generation_online_pipeline(tmp_path, monkeypatch):

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-#SBATCH --job-name=jev-online-train-seed17
+#SBATCH --job-name=jev-offline-train-seed17
 #SBATCH --gres=gpu:1
 #SBATCH --exclusive
 #SBATCH --cpus-per-task=24
@@ -11,4 +11,4 @@ export OBJECTIVE="${1:-paired_pg}"
 source slurm/startup.sh
 shift || true
 uv run python scripts/train.py --config "configs/train_${OBJECTIVE}.yaml" "$@"
-uv run python scripts/summarize.py
+uv run python scripts/summarize.py --runs "runs/offline_${OBJECTIVE}_seed17"

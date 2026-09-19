@@ -17,7 +17,7 @@ from .evaluation import mc_metrics, observed_metrics, plot_reliability, predict
 from .model import JevModel, load_tokenizer
 from .online_trainer import run_online
 from .optimization import optimization_step
-from .runtime import checkpoint, load_checkpoint, require_slurm
+from .runtime import atomic_checkpoint, checkpoint, load_checkpoint, require_slurm
 from .serialization import OUTCOMES as OUTCOME_IDS
 from .utils import digest, save_json, seed_all
 
@@ -29,6 +29,7 @@ def arguments():
     p.add_argument("--set", action="append", default=[], metavar="KEY=YAML_VALUE")
     p.add_argument("--output")
     p.add_argument("--initialize", action="store_true")
+    p.add_argument("--resume", action="store_true")
     a = p.parse_args()
     config = load_config(a.model_config)
     config.update(load_config(a.config))
@@ -46,7 +47,14 @@ def evaluate_run(model, tok, config, output):
     report = {}
     for split in ("test", "calibration"):
         rows = read_rows(root / f"{split}.jsonl")
-        probs = predict(model, tok, rows, config["microbatch"], config["max_length"])
+        probs = predict(
+            model,
+            tok,
+            rows,
+            config["inference_questions"],
+            config["max_length"],
+            config["inference_precision"],
+        )
         metrics = observed_metrics(probs, rows)
         save_json(output / f"{split}_metrics.json", metrics)
         save_json(
@@ -71,7 +79,14 @@ def evaluate_run(model, tok, config, output):
         assert mc_manifest["data_manifest_sha256"] == digest(root / "manifest.json")
         assert mc_manifest["sha256"] == digest(mcpath)
         rows = read_rows(mcpath)
-        probs = predict(model, tok, rows, config["microbatch"], config["max_length"])
+        probs = predict(
+            model,
+            tok,
+            rows,
+            config["inference_questions"],
+            config["max_length"],
+            config["inference_precision"],
+        )
         report.update(mc_metrics(probs, rows))
         save_json(
             output / "mc_predictions.json",
@@ -109,24 +124,50 @@ def main():
             c, Path(args.output or f"runs/online_{c['objective']}_seed{c['seed']}")
         )
         return
+    if c.get("mode") != "offline":
+        raise ValueError("mode must be offline or online")
+    for key in (
+        "steps",
+        "effective_batch",
+        "microbatch",
+        "eval_every",
+        "checkpoint_every",
+        "eval_questions",
+        "inference_questions",
+    ):
+        if not isinstance(c[key], int) or c[key] < 1:
+            raise ValueError(f"{key} must be a positive integer")
+    if c["effective_batch"] % c["microbatch"]:
+        raise ValueError("effective_batch must be divisible by microbatch")
     root = Path(c["data_dir"])
     manifest = json.loads((root / "manifest.json").read_text())
-    assert manifest["policy_sha256"] == digest("configs/heuristic.yaml")
+    assert manifest["training_labels"].startswith("one observed terminal event")
+    assert manifest["policy_sha256"] == digest(
+        manifest["config"]["heuristic_config"]
+    )
     assert manifest["policy_code_sha256"] == digest("src/jev2048/heuristic.py")
     for split, info in manifest["splits"].items():
         assert info["sha256"] == digest(root / f"{split}.jsonl")
     rows = read_rows(root / "train.jsonl")
     dev = read_rows(root / "dev.jsonl")[: c["eval_questions"]]
     assert all("q" not in r for r in rows)
-    output = Path(args.output or f"runs/{c['objective']}_seed{c['seed']}")
+    output = Path(args.output or f"runs/offline_{c['objective']}_seed{c['seed']}")
     output.mkdir(parents=True, exist_ok=True)
-    if any(output.iterdir()):
-        raise FileExistsError(f"Use a fresh run directory: {output}")
-    model, saved = load_checkpoint(c["common_init"])
-    assert saved["kind"] == "common_initialization_no_warmup"
+    resume_path = output / "resume.pt"
+    if args.resume:
+        if not resume_path.exists():
+            raise FileNotFoundError(resume_path)
+        model, saved = load_checkpoint(resume_path)
+        start_step = saved["step"]
+    else:
+        if any(output.iterdir()):
+            raise FileExistsError(f"Use a fresh run directory: {output}")
+        model, saved = load_checkpoint(c["common_init"])
+        if saved["kind"] != "common_initialization_no_warmup":
+            raise ValueError("All offline objectives require the common initialization")
+        start_step = 0
     for key in ("base_model", "head_width", "attention_heads", "seed"):
         assert saved["config"][key] == c[key], key
-    del saved
     tok = load_tokenizer(c["base_model"])
     optimizer = torch.optim.AdamW(
         [
@@ -143,6 +184,14 @@ def main():
         return max(0.0, (c["steps"] - step) / max(1, c["steps"] - c["warmup_steps"]))
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, schedule)
+    if args.resume:
+        optimizer.load_state_dict(saved["optimizer"])
+        scheduler.load_state_dict(saved["scheduler"])
+        torch.set_rng_state(saved["torch_rng"])
+        torch.cuda.set_rng_state(saved["cuda_rng"])
+        random.setstate(saved["python_rng"])
+        np.random.set_state(saved["numpy_rng"])
+    del saved
     rng = np.random.default_rng(c["seed"])
     indices = []
     while len(indices) < c["steps"] * c["effective_batch"]:
@@ -164,14 +213,14 @@ def main():
         ).hexdigest(),
         slurm_job_id=os.environ["SLURM_JOB_ID"],
     )
-    save_json(output / "resolved_config.json", meta)
-    (output / "resolved_config.yaml").write_text(yaml.safe_dump(c))
+    if not args.resume:
+        save_json(output / "resolved_config.json", meta)
+        (output / "resolved_config.yaml").write_text(yaml.safe_dump(c))
     torch.cuda.reset_peak_memory_stats()
     start = time.monotonic()
     micro = c["microbatch"]
-    with (output / "training.jsonl").open("w") as log:
-        for step in range(c["steps"]):
-            step_start = time.monotonic()
+    with (output / "training.jsonl").open("a" if args.resume else "w") as log:
+        for step in range(start_step, c["steps"]):
             batch_rows = [
                 rows[i]
                 for i in indices[
@@ -181,10 +230,20 @@ def main():
             record, micro = optimization_step(
                 model, tok, batch_rows, optimizer, scheduler, c, micro
             )
-            record.update(step=step + 1, elapsed_seconds=time.monotonic() - start)
+            record.pop("step_seconds", None)
+            record.pop("questions_per_second", None)
+            record["step"] = step + 1
             if (step + 1) % c["eval_every"] == 0 or step + 1 == c["steps"]:
                 dev_metrics = observed_metrics(
-                    predict(model, tok, dev, micro, c["max_length"]), dev
+                    predict(
+                        model,
+                        tok,
+                        dev,
+                        c["inference_questions"],
+                        c["max_length"],
+                        c["inference_precision"],
+                    ),
+                    dev,
                 )
                 save_json(output / "dev" / f"step_{step + 1:06d}.json", dev_metrics)
                 record["dev"] = {
@@ -195,6 +254,20 @@ def main():
             print(
                 json.dumps({k: v for k, v in record.items() if k != "dev"}), flush=True
             )
+            if (step + 1) % c["checkpoint_every"] == 0:
+                atomic_checkpoint(
+                    resume_path,
+                    model,
+                    c,
+                    optimizer=optimizer.state_dict(),
+                    scheduler=scheduler.state_dict(),
+                    step=step + 1,
+                    torch_rng=torch.get_rng_state(),
+                    cuda_rng=torch.cuda.get_rng_state(),
+                    python_rng=random.getstate(),
+                    numpy_rng=np.random.get_state(),
+                    metadata=meta,
+                )
     training_seconds = time.monotonic() - start
     stats = dict(
         training_seconds=training_seconds,

@@ -1,69 +1,50 @@
 中文 | [English](README_en.md)
 
-# 2048 game with online Jev (RLCD)
+# Offline Jev / RLCD for 2048
 
-复现Jev, 通过环境反馈, 在2048游戏中使用RLCD进行进化.
+本项目使用本地 `/root/shang/hf-modles/Qwen3.5-0.8B-Base` 研究静态数据上的 Jev 风格结果预测。模型不是动作分类器：对每个合法动作分别预测
 
-默认使用本地 `/root/shang/hf-modles/Qwen3.5-0.8B-Base`，全参数训练文本骨干与候选集合评分头
+`p(终局最大砖 | 当前棋盘, 首个动作, 冻结启发式 continuation π0)`。
 
-## Online RLCD流程
+输出为 `<256, 256, 512, 1024, 2048, 4096, 8192+` 上的完整概率分布。模型不生成文本；Qwen 文本骨干提取每个候选的表示，共享 set-attention 决策头在候选间归一化。视觉塔冻结，文本骨干和决策头全参数训练。
 
-1. 初始控制器为启发式策略。每代冻结当前控制器 `πt`。
-2. 用 `πt + 15% 随机动作` 在线探索棋盘，对选中状态的每个合法动作独立分支；后续严格由 `πt` 玩到终局，取得一次观测 `Y`。
-3. 更新 `p(y | s,a,πt)`；默认 paired-PG，32 个预测标签抽样，保留 detached 条件基线。也支持 CE/Brier。
-4. 冻结新模型，按终局桶的 `log2(tile)` 期望选择动作。候选与当前策略使用相同种子对局；平均终局 log-tile 达到配置的绝对提升才晋升。
-5. 只有策略晋升才增加 generation。晋升失败时继续当前 generation，并保留模型权重、Adam 状态和学习率进度；晋升后冻结新策略、重置优化器并重新采集反馈。
+## 数据与防泄漏
 
-输入同时包含原棋盘和执行候选动作后的确定性 afterstate（随机生成新砖之前），但不包含终局标签。无需预生成训练集；启发式 continuation 使用 CPU 异步预取，神经 continuation 和训练均在 Slurm GPU 上执行。
+固定行为策略从独立种子游戏采集棋盘。每个棋盘的所有合法首动作都从同一状态分支，随后固定启发式 `π0` 玩到终局。每个 `(state, action)` 仅保存一次真实随机终局事件，不保存 MC 概率作为训练标签。
 
-核心预算位于 `configs/online.yaml`：`max_policy_generations` 限制冻结策略版本数，`min/max_optimizer_steps_per_policy` 限制同一目标策略下的更新数，`promotion_interval_steps` 控制晋升检查频率，`max_total_optimizer_steps` 提供全局上限。
-
-## 验证与启动
+`train/dev/calibration/test` 使用互不重叠的源游戏种子；同一源游戏和同一棋盘的所有动作不会跨 split。`manifest.json` 保存配置、策略/模拟器哈希、split 计数和文件哈希，`audit_data.py` 会再次验证隔离。MC reference 从 test 棋盘另行生成，只用于评估。
 
 ```bash
 uv sync --locked
 uv run pytest -q
-uvx ruff check src scripts tests
-uv run python scripts/validate_online.py
+
+# 通过 Slurm 生成约 100k/2k/2k/4k questions 并自动审计
+sbatch slurm/generate_data.sbatch data/offline_pi0_v1
+# 数据完成后构建 evaluation-only MC reference
+sbatch slurm/build_mc_reference.sbatch data/offline_pi0_v1
 ```
 
-以下是之后的 GPU 验证/训练命令。先完成两阶段 smoke 并检查成功，再启动主实验：
+启发式基准（100 局、seed 17）：mean score 15543.88，median 15084，达到 512/1024/2048 的概率为 0.96/0.72/0.18。训练数据生成后不得调整 `π0`。
+
+## 训练目标
+
+- `ce`：观测结果的负对数似然。
+- `brier`：预测分布与观测 one-hot 的向量 Brier loss。
+- `paired_pg`：32 个预测结果标签抽样和 detached 条件 baseline 的 RLCD-inspired proper-reward PG。这里的抽样是结果标签，不是 2048 动作。
+
+三者使用完全相同的数据、batch schedule、seed、优化步数和 `runs/offline_common_init.pt`。主配置在 `configs/offline.yaml`，默认 500 steps、effective batch 256、microbatch 16。paired-PG 的环境反馈已经冻结在离线数据中；训练阶段不再 rollout。
 
 ```bash
-mkdir -p logs/slurm
-sbatch slurm/smoke_gpu.sbatch
-# 上一作业通过后：
-sbatch slurm/online_smoke.sbatch
-# 在线 smoke 完成后：
-uv run python scripts/verify_training_smoke.py --run runs/online_expected_log_tile_smoke
+# GPU 操作只能经 Slurm；先创建一次公共初始化
+sbatch slurm/initialize.sbatch
 
-# 主实验（仅在准备好后手动提交）
-sbatch --job-name=jev-online-pg-seed17 slurm/train.sbatch paired_pg
-# 或三目标独立在线实验：
+# 单目标或三目标比较
+sbatch --job-name=jev-offline-pg-seed17 slurm/train.sbatch paired_pg
 bash slurm/submit_all.sh
 bash slurm/status.sh
 # bash slurm/cancel.sh JOB_ID [JOB_ID ...]
 ```
 
-配置位于 `configs/online.yaml`, 从本地 base 和 seed 初始化，也可指定 `initial_checkpoint`。三个目标初始权重与随机种子相同，但在线策略分化后采样轨迹会不同，比较时也需看环境交互量和耗时。
+`training.jsonl` 记录 loss、梯度、reward/advantage、NLL、Brier、熵、top-1 和预测分布，不记录逐步耗时或显存。`training_stats.json` 单独保存总训练时间和峰值显存。测试报告在对应 `runs/offline_*_seed17/`；`scripts/summarize.py` 生成 `results/comparison.{json,csv,md}`。
 
-## 结果与评估
-
-`runs/online_paired_pg_seed17/`：
-
-- `training.jsonl`：reward、优势统计、NLL/Brier、预测/观测平均 log-tile 及其总体偏差、预测分布和环境交互量；不记录显存。单次随机终局不能提供真实 expected log-tile，因此不报告会误导的逐样本 MAE。
-- `generation_XXX/events.jsonl`：本代实际用于更新的单次环境反馈，作为审计记录，不是预生成训练集。
-- `generation_XXX/checkpoint.pt`：最后一次晋升检查使用的学习器权重；其预测目标由 `target_policy.json` 指定。
-- `generation_XXX/metrics.json`：固定 holdout 棋盘上的概率指标、MC 动作排序一致率和效用 regret。每代按对应冻结策略重采标签与 MC 概率。
-- `promotion_step_XXXXXX.json`：各次晋升检查；`promotion.json` 是最后一次检查；`controller_test.json` 是不参与晋升的独立测试。
-- `active_policy.json`：真正获准接管的策略，可能仍是启发式；不能把最后一个 checkpoint 自动当成更好的控制器。
-
-```bash
-sbatch slurm/evaluate.sbatch --run runs/online_paired_pg_seed17/generation_000
-sbatch slurm/play.sbatch --run runs/online_paired_pg_seed17 --policy active --games 100 --seed 0
-uv run python scripts/summarize.py
-```
-
-汇总输出为 `results/comparison.{csv,json,md}`，概率指标与闭环得分分表保存。训练、holdout、MC、晋升和测试使用隔离随机流；holdout 棋盘固定，MC 标签只用于评估。
-
-单次观测标签上的正式概率指标是 NLL/Brier。Expected log-tile 误差仅在 MC reference 上比较 `pᵀu` 与 `q_hatᵀu`；控制能力则使用配对种子闭环游戏的平均终局 log-tile。总体均值偏差只检查系统性高估/低估，不能衡量逐状态期望误差。
+NLL/Brier/ECE 衡量概率质量，top-1 不是校准。MC 概率从不参与训练。闭环游戏成绩是单独的控制演示，不能直接视为 `π0` 条件下的校准结论。

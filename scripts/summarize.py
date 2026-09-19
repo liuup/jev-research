@@ -76,9 +76,9 @@ if __name__ == "__main__":
         "--runs",
         nargs="+",
         default=[
-            "runs/online_ce_seed17",
-            "runs/online_brier_seed17",
-            "runs/online_paired_pg_seed17",
+            "runs/offline_ce_seed17",
+            "runs/offline_brier_seed17",
+            "runs/offline_paired_pg_seed17",
         ],
     )
     p.add_argument("--output", default="results/comparison")

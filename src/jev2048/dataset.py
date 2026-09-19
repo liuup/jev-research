@@ -2,6 +2,8 @@
 
 import json
 import random
+import subprocess
+from collections import Counter, defaultdict
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
@@ -14,26 +16,38 @@ from .serialization import OUTCOMES, bucket, serialize
 from .utils import digest, save_json
 
 
-def rollout(state, action, seed, policy=None):
+def rollout_event(state, action, seed, policy=None):
     game = Game(seed=seed, **{k: state[k] for k in ("board", "score", "steps")})
     policy = policy or HeuristicPolicy()
     if not game.step(action):
         raise ValueError("Illegal first action")
     while not game.terminal:
         game.step(policy.choose(game))
-    return bucket(game.max_tile)
+    return dict(
+        observed_outcome=bucket(game.max_tile),
+        terminal_max_tile=game.max_tile,
+        terminal_score=game.score,
+        rollout_steps=game.steps - state["steps"],
+    )
+
+
+def rollout(state, action, seed, policy=None):
+    return rollout_event(state, action, seed, policy)["observed_outcome"]
 
 
 def source_game(args):
     split, game_seed, config = args
-    game, policy = Game(game_seed), HeuristicPolicy()
-    rng = random.Random(game_seed + 1000000000)
+    game = Game(game_seed)
+    policy = HeuristicPolicy(config["heuristic_config"])
+    behavior_rng = random.Random(game_seed + 1000000000)
+    rollout_rng = random.Random(game_seed + 2000000000)
+    policy_id = f"heuristic:{digest(config['heuristic_config'])}"
     rows = []
     while not game.terminal:
         if game.steps % config["select_every"] == 0:
             state = game.state()
             for action in game.legal_actions:
-                seed = rng.randrange(2**63)
+                seed = rollout_rng.randrange(2**63)
                 rows.append(
                     dict(
                         **state,
@@ -41,12 +55,13 @@ def source_game(args):
                         state_id=f"{split}:{game_seed}:{game.steps}",
                         source_game=f"{split}:{game_seed}",
                         rollout_seed=seed,
-                        observed_outcome=rollout(state, action, seed, policy),
+                        continuation_policy_id=policy_id,
+                        **rollout_event(state, action, seed, policy),
                     )
                 )
         action = (
-            rng.choice(game.legal_actions)
-            if rng.random() < config["random_action_probability"]
+            behavior_rng.choice(game.legal_actions)
+            if behavior_rng.random() < config["random_action_probability"]
             else policy.choose(game)
         )
         game.step(action)
@@ -58,17 +73,35 @@ def generate(config, output):
     output.mkdir(parents=True, exist_ok=True)
     if any(output.glob("*.json*")):
         raise FileExistsError(f"Refusing to overwrite dataset: {output}")
+    required_splits = {"train", "dev", "calibration", "test"}
+    if set(config["questions"]) != required_splits:
+        raise ValueError(f"Expected exactly these splits: {sorted(required_splits)}")
+    if set(config["split_seeds"]) != required_splits:
+        raise ValueError("Every split needs an independent seed range")
+    if len(set(config["split_seeds"].values())) != len(required_splits):
+        raise ValueError("Split seeds must be unique")
     if config["select_every"] < 1 or any(n < 1 for n in config["questions"].values()):
         raise ValueError("Question counts and selection interval must be positive")
     benchmark = json.loads(Path("results/heuristic_benchmark.json").read_text())
     assert benchmark["games"] >= 100
-    assert benchmark["policy_sha256"] == digest("configs/heuristic.yaml")
+    assert benchmark["policy_sha256"] == digest(config["heuristic_config"])
     manifest = dict(
+        schema_version=2,
         config=config,
-        policy_sha256=digest("configs/heuristic.yaml"),
+        git_commit=subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], text=True
+        ).strip(),
+        git_dirty=bool(
+            subprocess.check_output(["git", "status", "--porcelain"], text=True).strip()
+        ),
+        generator_code_sha256=digest("src/jev2048/dataset.py"),
+        policy_sha256=digest(config["heuristic_config"]),
         policy_code_sha256=digest("src/jev2048/heuristic.py"),
+        simulator_sha256=digest("src/jev2048/env.py"),
+        training_labels="one observed terminal event per state-action; never MC probabilities",
         splits={},
     )
+    split_groups = {}
     for split, count in config["questions"].items():
         rows, game_ids, index = [], [], 0
         with ProcessPoolExecutor(config["workers"]) as pool:
@@ -91,10 +124,25 @@ def generate(config, output):
         rows = rows[:end]
         path = output / f"{split}.jsonl"
         path.write_text("".join(json.dumps(r) + "\n" for r in rows))
+        groups = sorted({row["source_game"] for row in rows})
+        split_groups[split] = {
+            int(source_game.rsplit(":", 1)[1]) for source_game in groups
+        }
         manifest["splits"][split] = dict(
-            questions=len(rows), source_seeds=game_ids, sha256=digest(path)
+            questions=len(rows),
+            states=len({row["state_id"] for row in rows}),
+            source_games=len(groups),
+            source_seeds=game_ids,
+            outcome_counts=dict(Counter(row["observed_outcome"] for row in rows)),
+            sha256=digest(path),
         )
         print(split, len(rows), flush=True)
+    if any(
+        left & right
+        for index, left in enumerate(split_groups.values())
+        for right in list(split_groups.values())[index + 1 :]
+    ):
+        raise AssertionError("Source-game leakage across dataset splits")
     save_json(output / "manifest.json", manifest)
 
 
@@ -103,15 +151,24 @@ def read_rows(path):
 
 
 def mc_pair(args):
-    row, repeats, seed = args
+    row, repeats, seed, heuristic_config = args
     counts = np.zeros(len(OUTCOMES), dtype=int)
-    rng, policy = random.Random(seed), HeuristicPolicy()
+    rng, policy = random.Random(seed), HeuristicPolicy(heuristic_config)
     for _ in range(repeats):
         counts[
             OUTCOMES.index(rollout(row, row["action"], rng.randrange(2**63), policy))
         ] += 1
     return {
-        k: v for k, v in row.items() if k not in ("observed_outcome", "rollout_seed")
+        k: v
+        for k, v in row.items()
+        if k
+        not in (
+            "observed_outcome",
+            "rollout_seed",
+            "terminal_max_tile",
+            "terminal_score",
+            "rollout_steps",
+        )
     } | dict(
         counts=counts.tolist(),
         q=(counts / repeats).tolist(),
@@ -120,21 +177,39 @@ def mc_pair(args):
     )
 
 
-def build_reference(data_dir, pairs=256, repeats=256, workers=16, seed=717):
+def build_reference(data_dir, states=64, repeats=256, workers=16, seed=717):
     root = Path(data_dir)
-    if pairs < 1 or repeats < 2:
-        raise ValueError("Need positive pair count and at least two MC rollouts")
+    if states < 1 or repeats < 2:
+        raise ValueError("Need positive state count and at least two MC rollouts")
     if (root / "mc_reference.jsonl").exists():
         raise FileExistsError("Reference cohort is frozen; choose a new data directory")
     manifest = json.loads((root / "manifest.json").read_text())
-    assert manifest["policy_sha256"] == digest("configs/heuristic.yaml")
+    heuristic_config = manifest["config"]["heuristic_config"]
+    assert manifest["policy_sha256"] == digest(heuristic_config)
     assert manifest["policy_code_sha256"] == digest("src/jev2048/heuristic.py")
-    cohort = random.Random(seed).sample(read_rows(root / "test.jsonl"), pairs)
+    by_state = defaultdict(list)
+    for row in read_rows(root / "test.jsonl"):
+        by_state[row["state_id"]].append(row)
+    if states > len(by_state):
+        raise ValueError(f"Requested {states} states from only {len(by_state)}")
+    selected = random.Random(seed).sample(sorted(by_state), states)
+    cohort = [row for state_id in selected for row in by_state[state_id]]
+    for state_id in selected:
+        game = Game(
+            board=by_state[state_id][0]["board"],
+            score=by_state[state_id][0]["score"],
+            steps=by_state[state_id][0]["steps"],
+        )
+        if [row["action"] for row in by_state[state_id]] != game.legal_actions:
+            raise AssertionError("MC reference requires every legal action per state")
     with ProcessPoolExecutor(workers) as pool:
         rows = list(
             pool.map(
                 mc_pair,
-                [(r, repeats, seed + i + 100000000) for i, r in enumerate(cohort)],
+                [
+                    (r, repeats, seed + i + 100000000, heuristic_config)
+                    for i, r in enumerate(cohort)
+                ],
             )
         )
     path = root / "mc_reference.jsonl"
@@ -142,7 +217,8 @@ def build_reference(data_dir, pairs=256, repeats=256, workers=16, seed=717):
     save_json(
         root / "mc_manifest.json",
         dict(
-            pairs=pairs,
+            states=states,
+            pairs=len(rows),
             repeats=repeats,
             seed=seed,
             training_labels=False,

@@ -13,8 +13,11 @@ rollouts_per_problem: 4
 max_steps: 8
 max_quantities: 6
 steps_per_generation: 200
-effective_batch: 32
-microbatch: 8
+# Measured on the RTX 5090 (scripts/benchmark_batches.py): training throughput peaks at
+# microbatch 16-32 (52 rows/s, 7.0-8.3 GiB) with gradient checkpointing. Dropping
+# checkpointing reaches 63 rows/s but needs 23.4 GiB at microbatch 16 and fails at 32.
+effective_batch: 64
+microbatch: 32
 backbone_lr: 0.00002
 head_lr: 0.0002
 weight_decay: 0.01
@@ -25,6 +28,8 @@ validation_fraction: 0.1
 split_seed: 27000000
 validation_problems: 128
 test_problems: 1319
+# Rollout scoring: throughput plateaus near 107k tokens/s from 16 questions per forward
+# upward, so small forwards win on memory (16 questions = 1.9 GiB, 512 = 20.5 GiB).
 inference_questions: 16
 temperature: 1.0
 rollout_mode: sample

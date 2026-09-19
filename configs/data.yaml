@@ -1,6 +1,6 @@
-seed: 17
+seed: 25
 questions: {train: 50000, dev: 512, calibration: 512, test: 512}
-split_seeds: {train: 17000000, dev: 27000000, calibration: 37000000, test: 47000000}
+split_seeds: {train: 25000000, dev: 35000000, calibration: 45000000, test: 55000000}
 random_action_probability: 0.15
 select_every: 20
 workers: 16

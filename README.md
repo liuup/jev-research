@@ -4,7 +4,7 @@
 
 复现Jev, 通过环境反馈, 在2048游戏中使用RLCD进行进化.
 
-默认使用本地 `/root/shang/hf-modles/Qwen3.5-0.8B-Base`，全参数训练文本骨干与候选集合评分头
+默认使用本地 `/work/s0liu022/hf-models/Qwen3.5-0.8B`，全参数训练文本骨干与候选集合评分头
 
 ## Online RLCD流程
 
@@ -43,7 +43,7 @@ sbatch slurm/online_smoke.sbatch
 python scripts/verify_training_smoke.py --run runs/online_expected_log_tile_smoke
 
 # 主实验（仅在准备好后手动提交）
-sbatch --job-name=jev-online-pg-seed17 slurm/train.sbatch paired_pg
+sbatch --job-name=jev-online-pg-seed25 slurm/train.sbatch paired_pg
 # 或三目标独立在线实验：
 bash slurm/submit_all.sh
 bash slurm/status.sh
@@ -54,7 +54,7 @@ bash slurm/status.sh
 
 ## 结果与评估
 
-`runs/online_paired_pg_seed17/`：
+`runs/online_paired_pg_seed25/`：
 
 - `training.jsonl`：reward、优势统计、NLL/Brier、expected log-tile 误差、预测分布及环境交互量；不记录显存。
 - `generation_XXX/events.jsonl`：本代实际用于更新的单次环境反馈，作为审计记录，不是预生成训练集。
@@ -64,8 +64,8 @@ bash slurm/status.sh
 - `active_policy.json`：真正获准接管的策略，可能仍是启发式；不能把最后一个 checkpoint 自动当成更好的控制器。
 
 ```bash
-sbatch slurm/evaluate.sbatch --run runs/online_paired_pg_seed17/generation_000
-sbatch slurm/play.sbatch --run runs/online_paired_pg_seed17 --policy active --games 100 --seed 0
+sbatch slurm/evaluate.sbatch --run runs/online_paired_pg_seed25/generation_000
+sbatch slurm/play.sbatch --run runs/online_paired_pg_seed25 --policy active --games 100 --seed 25
 python scripts/summarize.py
 ```
 

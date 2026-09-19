@@ -3,7 +3,6 @@ import hashlib
 import json
 import os
 import random
-import subprocess
 import time
 from pathlib import Path
 
@@ -46,7 +45,7 @@ def evaluate_run(model, tok, config, output):
     report = {}
     for split in ("test", "calibration"):
         rows = read_rows(root / f"{split}.jsonl")
-        probs = predict(model, tok, rows, config["microbatch"], config["max_length"])
+        probs = predict(model, tok, rows, config["microbatch"], config["max_length"], config["inference_precision"])
         metrics = observed_metrics(probs, rows)
         save_json(output / f"{split}_metrics.json", metrics)
         save_json(
@@ -71,7 +70,7 @@ def evaluate_run(model, tok, config, output):
         assert mc_manifest["data_manifest_sha256"] == digest(root / "manifest.json")
         assert mc_manifest["sha256"] == digest(mcpath)
         rows = read_rows(mcpath)
-        probs = predict(model, tok, rows, config["microbatch"], config["max_length"])
+        probs = predict(model, tok, rows, config["microbatch"], config["max_length"], config["inference_precision"])
         report.update(mc_metrics(probs, rows))
         save_json(
             output / "mc_predictions.json",
@@ -150,12 +149,9 @@ def main():
     indices = indices[: c["steps"] * c["effective_batch"]]
     meta = dict(
         config=c,
-        git_commit=subprocess.check_output(
-            ["git", "rev-parse", "HEAD"], text=True
-        ).strip(),
-        git_dirty=bool(
-            subprocess.check_output(["git", "status", "--porcelain"], text=True).strip()
-        ),
+        git_commit=os.environ["JEV_GIT_COMMIT"],
+        git_dirty=None,
+        git_dirty_reason="git executable unavailable on compute nodes",
         versions=dict(torch=torch.__version__),
         data_manifest_sha256=digest(root / "manifest.json"),
         common_init_sha256=digest(c["common_init"]),
@@ -184,7 +180,7 @@ def main():
             record.update(step=step + 1, elapsed_seconds=time.monotonic() - start)
             if (step + 1) % c["eval_every"] == 0 or step + 1 == c["steps"]:
                 dev_metrics = observed_metrics(
-                    predict(model, tok, dev, micro, c["max_length"]), dev
+                    predict(model, tok, dev, micro, c["max_length"], c["inference_precision"]), dev
                 )
                 save_json(output / "dev" / f"step_{step + 1:06d}.json", dev_metrics)
                 record["dev"] = {

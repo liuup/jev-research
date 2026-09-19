@@ -4,7 +4,7 @@
 
 This project reproduces the core idea of Jev and evolves a 2048 agent with RLCD using feedback from the environment.
 
-By default, it uses the local `/root/shang/hf-modles/Qwen3.5-0.8B-Base` checkpoint and performs full-parameter training of the text backbone and candidate-set scoring head.
+By default, it uses the local `/work/s0liu022/hf-models/Qwen3.5-0.8B` checkpoint and performs full-parameter training of the text backbone and candidate-set scoring head.
 
 ## Online RLCD Workflow
 
@@ -43,7 +43,7 @@ sbatch slurm/online_smoke.sbatch
 python scripts/verify_training_smoke.py --run runs/online_expected_log_tile_smoke
 
 # Main experiment (submit manually only when ready)
-sbatch --job-name=jev-online-pg-seed17 slurm/train.sbatch paired_pg
+sbatch --job-name=jev-online-pg-seed25 slurm/train.sbatch paired_pg
 # Or launch three independent online objectives:
 bash slurm/submit_all.sh
 bash slurm/status.sh
@@ -54,7 +54,7 @@ Configuration is stored in `configs/online.yaml`. Training initializes from the 
 
 ## Results and Evaluation
 
-Under `runs/online_paired_pg_seed17/`:
+Under `runs/online_paired_pg_seed25/`:
 
 - `training.jsonl`: reward, advantage statistics, NLL/Brier, expected-log-tile errors, predicted distributions, and environment interaction counts; GPU memory is not recorded here.
 - `generation_XXX/events.jsonl`: the single-outcome environment feedback actually consumed for updates in that generation. This is an audit log, not a pre-generated training dataset.
@@ -64,8 +64,8 @@ Under `runs/online_paired_pg_seed17/`:
 - `active_policy.json`: the policy actually approved to control the game. It may still be the heuristic policy; the latest checkpoint must not automatically be treated as the stronger controller.
 
 ```bash
-sbatch slurm/evaluate.sbatch --run runs/online_paired_pg_seed17/generation_000
-sbatch slurm/play.sbatch --run runs/online_paired_pg_seed17 --policy active --games 100 --seed 0
+sbatch slurm/evaluate.sbatch --run runs/online_paired_pg_seed25/generation_000
+sbatch slurm/play.sbatch --run runs/online_paired_pg_seed25 --policy active --games 100 --seed 25
 python scripts/summarize.py
 ```
 

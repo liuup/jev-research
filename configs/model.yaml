@@ -1,7 +1,8 @@
-base_model: /root/shang/hf-modles/Qwen3.5-0.8B-Base
-seed: 17
+base_model: /work/s0liu022/hf-models/Qwen3.5-0.8B
+seed: 25
 max_length: 512
 head_width: 256
 attention_heads: 4
+# Keep checkpointing: the current Qwen 3.5 PyTorch fallback OOMs at microbatch 32 without it.
 gradient_checkpointing: true
-inference_precision: fp32
+inference_precision: bf16

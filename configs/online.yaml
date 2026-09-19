@@ -1,12 +1,13 @@
 mode: online
-seed: 17
+seed: 25
 max_policy_generations: 2
 min_optimizer_steps_per_policy: 500
 max_optimizer_steps_per_policy: 1000
 promotion_interval_steps: 250
 max_total_optimizer_steps: 2000
-effective_batch: 32
-microbatch: 16
+# H100 NVL 96 GB benchmark: microbatch 256 used 63.7 GiB allocated / 72.2 GiB reserved.
+effective_batch: 256
+microbatch: 256
 backbone_lr: 0.00002
 head_lr: 0.0002
 weight_decay: 0.01
@@ -18,17 +19,17 @@ baseline: conditional
 initial_checkpoint: ""
 common_init: runs/common_init.pt
 heuristic_config: configs/heuristic.yaml
-source_envs: 8
+source_envs: 16
 prefetch_batches: 4
 behavior_epsilon: 0.15
 select_every: 16
-inference_questions: 64
+inference_questions: 256
 validation_questions: 256
 mc_states: 4
 mc_rollouts: 16
 promotion_games: 64
 test_games: 32
-game_batch: 16
+game_batch: 64
 promotion_min_log_tile_gain: 0.10
 utility: log_tile
 threshold: 2048

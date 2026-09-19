@@ -13,6 +13,6 @@ python -m pytest -q
 python scripts/validate_online.py
 python scripts/verify_training_smoke.py --run runs/online_smoke
 for objective in paired_pg ce brier; do
-    job=$(sbatch --parsable --job-name="jev-online-${objective}-seed17" slurm/train.sbatch "$objective" "$@")
+    job=$(sbatch --parsable --job-name="jev-online-${objective}-seed25" slurm/train.sbatch "$objective" "$@")
     echo "$objective: $job"
 done

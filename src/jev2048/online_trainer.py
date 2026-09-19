@@ -4,7 +4,6 @@ import copy
 import json
 import os
 import random
-import subprocess
 import time
 from pathlib import Path
 
@@ -96,7 +95,7 @@ def probability_evaluation(model, tokenizer, c, questions, policy, generation, o
         policy,
     )
     write_jsonl(output / "validation.jsonl", validation)
-    p = predict(model, tokenizer, validation, c["inference_questions"], c["max_length"])
+    p = predict(model, tokenizer, validation, c["inference_questions"], c["max_length"], c["inference_precision"])
     metrics = observed_metrics(p, validation)
     save_json(
         output / "initial_validation_predictions.json",
@@ -150,12 +149,9 @@ def run_online(
         initial_sha256=digest(output / "initial.pt"),
         initial_checkpoint=c.get("initial_checkpoint") or None,
         initial_policy=incumbent.spec,
-        git_commit=subprocess.check_output(
-            ["git", "rev-parse", "HEAD"], text=True
-        ).strip(),
-        git_dirty=bool(
-            subprocess.check_output(["git", "status", "--porcelain"], text=True).strip()
-        ),
+        git_commit=os.environ["JEV_GIT_COMMIT"],
+        git_dirty=None,
+        git_dirty_reason="git executable unavailable on compute nodes",
         versioning="one frozen continuation policy per generation; no cross-generation replay",
         simulator_sha256=digest(Path(__file__).with_name("env.py")),
         policy_source_sha256=digest(Path(__file__).with_name("policies.py")),
@@ -294,8 +290,6 @@ def run_online(
                             k: cumulative[k] + collector.counters[k] for k in cumulative
                         },
                     )
-                    record.pop("step_seconds", None)
-                    record.pop("questions_per_second", None)
                     at_policy_limit = (
                         policy_step == c["max_optimizer_steps_per_policy"]
                         or global_step == c["max_total_optimizer_steps"]
@@ -308,6 +302,7 @@ def run_online(
                                 validation,
                                 c["inference_questions"],
                                 c["max_length"],
+                                c["inference_precision"],
                             ),
                             validation,
                         )
@@ -428,7 +423,7 @@ def run_online(
                 cumulative[key] += collector.counters[key]
 
             final_p = predict(
-                model, tokenizer, validation, c["inference_questions"], c["max_length"]
+                model, tokenizer, validation, c["inference_questions"], c["max_length"], c["inference_precision"]
             )
             metrics = observed_metrics(final_p, validation)
             save_json(
@@ -458,7 +453,7 @@ def run_online(
             )
             write_jsonl(folder / "mc_reference.jsonl", mc_rows)
             mc_p = predict(
-                model, tokenizer, mc_rows, c["inference_questions"], c["max_length"]
+                model, tokenizer, mc_rows, c["inference_questions"], c["max_length"], c["inference_precision"]
             )
             save_json(folder / "mc_predictions.json", mc_p.tolist())
             metrics.update(mc_metrics(mc_p, mc_rows))
@@ -539,7 +534,7 @@ def reevaluate_online(run):
     if any(r["policy_id"] != policy.policy_id for r in rows):
         raise ValueError("Validation target mismatch")
     metrics = observed_metrics(
-        predict(model, tokenizer, rows, c["inference_questions"], c["max_length"]), rows
+        predict(model, tokenizer, rows, c["inference_questions"], c["max_length"], c["inference_precision"]), rows
     )
     mc = [
         json.loads(line)
@@ -547,7 +542,7 @@ def reevaluate_online(run):
     ]
     if any(r["policy_id"] != policy.policy_id for r in mc):
         raise ValueError("MC target mismatch")
-    p = predict(model, tokenizer, mc, c["inference_questions"], c["max_length"])
+    p = predict(model, tokenizer, mc, c["inference_questions"], c["max_length"], c["inference_precision"])
     metrics.update(mc_metrics(p, mc))
     metrics["action_ranking"] = action_ranking_metrics(
         p, mc, c["utility"], c["threshold"]

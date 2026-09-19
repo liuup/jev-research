@@ -120,7 +120,7 @@ def mc_pair(args):
     )
 
 
-def build_reference(data_dir, pairs=256, repeats=256, workers=16, seed=717):
+def build_reference(data_dir, pairs=256, repeats=256, workers=16, seed=25):
     root = Path(data_dir)
     if pairs < 1 or repeats < 2:
         raise ValueError("Need positive pair count and at least two MC rollouts")

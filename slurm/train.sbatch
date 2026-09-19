@@ -3,7 +3,7 @@
 #SBATCH --job-name=jevmath-train
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
-#SBATCH --mem=64G
+#SBATCH --mem=48G
 #SBATCH --time=120:00:00
 # Measured: one generation is about 3.2 h (collection dominates), so 20 generations
 # plus the test evaluation need well over 48 h. The partition has no time limit.

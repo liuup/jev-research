@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Ten-step GPU smoke of the 24 game loop: one tiny generation, all metrics reported.
-#SBATCH --job-name=24game-smoke
+#SBATCH --job-name=24game-pg-smoke-s17
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=24
 #SBATCH --mem=48G

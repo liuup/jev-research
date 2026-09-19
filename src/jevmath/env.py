@@ -9,7 +9,7 @@ offered. An episode ends after three operations, when one value is left.
 
 from fractions import Fraction
 
-from .puzzles import TARGET, apply_op, is_solvable
+from .puzzles import apply_op, is_solvable
 
 OPS = ("+", "-", "*", "/")
 COMMUTATIVE = ("+", "*")
@@ -144,5 +144,6 @@ def split_action_key(key):
 def solved_after(state, action):
     """Whether the operation keeps the remaining values solvable."""
     return is_solvable(
-        state.remaining_after(action["left"], action["right"], action["value"]), TARGET
+        state.remaining_after(action["left"], action["right"], action["value"]),
+        state.target,
     )

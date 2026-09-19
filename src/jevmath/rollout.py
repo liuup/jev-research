@@ -7,6 +7,7 @@ label of a row is the observed event: did that episode finish on the target?
 
 import math
 import random
+import time
 
 import numpy as np
 import torch
@@ -100,7 +101,14 @@ def rollout_batch(model, tokenizer, puzzles, config, seeds, mode="sample"):
     states = [State.initial(puzzle) for puzzle in puzzles]
     rngs = [random.Random(seed) for seed in seeds]
     records = [
-        dict(puzzle=puzzle, steps=[], solved=False, answer=None) for puzzle in puzzles
+        dict(
+            puzzle=puzzle,
+            rollout_seed=int(seed),
+            steps=[],
+            solved=False,
+            answer=None,
+        )
+        for puzzle, seed in zip(puzzles, seeds)
     ]
     active = list(range(len(states)))
     while active:
@@ -149,6 +157,7 @@ def record_json(record):
     puzzle = record["puzzle"]
     return dict(
         puzzle_id=puzzle["puzzle_id"],
+        rollout_seed=record["rollout_seed"],
         numbers=list(puzzle["numbers"]),
         target=puzzle["target"],
         answer=record["answer"],
@@ -174,15 +183,14 @@ def record_json(record):
 
 
 def training_rows(records, policy_id):
-    """Deduplicated training rows: one observed outcome per ``(state, action)``."""
-    rows, seen, duplicates = [], set(), 0
-    for record in records:
+    """Keep every rollout event, including repeated stochastic observations of x."""
+    rows, seen, repeated = [], set(), 0
+    for record_index, record in enumerate(records):
         outcome = "yes" if record["solved"] else "no"
-        for step in record["steps"]:
+        for step_index, step in enumerate(record["steps"]):
             key = (step["state"].state_id(), step["chosen"])
             if key in seen:
-                duplicates += 1
-                continue
+                repeated += 1
             seen.add(key)
             row = question_row(
                 step["state"], step["action"], policy_id, candidate_id="yes"
@@ -192,9 +200,14 @@ def training_rows(records, policy_id):
                 | dict(
                     observed_outcome=outcome,
                     controller=step["controller"],
+                    rollout_seed=record["rollout_seed"],
+                    event_id=(
+                        f"{step['state'].puzzle_id}:{record['rollout_seed']}:"
+                        f"{record_index}:{step_index}"
+                    ),
                 )
             )
-    return rows, duplicates
+    return rows, repeated
 
 
 def rollout_seeds(puzzles, config, generation, repeats):
@@ -213,20 +226,19 @@ def rollout_seeds(puzzles, config, generation, repeats):
 
 def collect(model, tokenizer, puzzles, config, generation, mode="sample"):
     """Roll out every puzzle ``rollouts_per_puzzle`` times and build training rows."""
-    import time
-
     repeats = config["rollouts_per_puzzle"]
     ordered, seeds = rollout_seeds(puzzles, config, generation, repeats)
     started = time.monotonic()
     records = rollout_batch(model, tokenizer, ordered, config, seeds, mode=mode)
-    rows, duplicates = training_rows(records, config["policy_id"])
+    rows, repeated = training_rows(records, config["policy_id"])
     metrics = dict(
         generation=generation,
         puzzles=len(puzzles),
         rollouts=len(records),
         states_visited=sum(len(record["steps"]) for record in records),
         training_rows=len(rows),
-        duplicate_rows=duplicates,
+        unique_state_actions=len(rows) - repeated,
+        repeated_state_action_events=repeated,
         solved_rate=_rate(sum(record["solved"] for record in records), len(records)),
         row_yes_rate=_rate(
             sum(row["observed_outcome"] == "yes" for row in rows), len(rows)

@@ -44,9 +44,8 @@ def smoke(root="runs/smoke", data_dir="data/24game", generations=1):
         for key in CHECKS:
             assert key in rollout, f"rollout metrics missing {key}"
         assert rollout["training_rows"] > 0, rollout
-        dev = summary["dev"]
+        dev = summary["dev_calibration"]
         for key in (
-            "solved_rate",
             "binary_brier",
             "observed_nll",
             "ece_ge_correct",
@@ -54,18 +53,21 @@ def smoke(root="runs/smoke", data_dir="data/24game", generations=1):
             "oracle_separation",
         ):
             assert key in dev, f"dev metrics missing {key}"
-        assert 0.0 <= dev["solved_rate"] <= 1.0
         assert dev["binary_brier"] >= 0.0
-        report["generations"].append(dict(rollout=rollout, dev=dev))
+        assert 0.0 <= summary["frozen_dev_rollout"]["solved_rate"] <= 1.0
+        controller = summary["dev_controller"]
+        assert 0.0 <= controller["solved_rate"] <= 1.0
+        report["generations"].append(
+            dict(rollout=rollout, dev_calibration=dev, dev_controller=controller)
+        )
     rows = [
         json.loads(line)
         for line in (output / "generation_000" / "rows.jsonl").read_text().splitlines()
     ]
     assert rows, "no training rows written"
     assert all(row["observed_outcome"] in ("yes", "no") for row in rows), rows[0]
-    assert len({(row["state_id"], row["action_key"]) for row in rows}) == len(rows), (
-        "training rows must be unique per (state, action)"
-    )
+    assert len({row["event_id"] for row in rows}) == len(rows), "event ids must be unique"
+    assert len(rows) == report["generations"][0]["rollout"]["states_visited"]
     assert (output / "checkpoint.pt").exists(), "no checkpoint"
     assert (output / "summary.json").exists(), "no summary"
     report["rows"] = len(rows)

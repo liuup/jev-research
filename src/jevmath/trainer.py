@@ -19,6 +19,7 @@ import yaml
 
 from .config import load_config
 from .evaluation import (
+    evaluate_observed_rows,
     observed_metrics,
     oracle_separation,
     plot_reliability,
@@ -37,6 +38,8 @@ INTEGER_KEYS = (
     "generations",
     "puzzles_per_generation",
     "rollouts_per_puzzle",
+    "validation_rollouts_per_puzzle",
+    "test_rollouts_per_puzzle",
     "steps_per_generation",
     "effective_batch",
     "microbatch",
@@ -93,7 +96,15 @@ def generation_config(config, generation):
     return dict(config, policy_id=generation_policy_id(config, generation), solver_mix=mix)
 
 
-def evaluate_policy(model, tokenizer, puzzles, config, mode="greedy", oracle=None):
+def evaluate_policy(
+    model,
+    tokenizer,
+    puzzles,
+    config,
+    mode="greedy",
+    oracle=None,
+    probability_metrics=True,
+):
     """Roll out puzzles under the current policy and score the visited rows."""
     ordered, seeds = [], []
     for index, puzzle in enumerate(puzzles):
@@ -133,7 +144,7 @@ def evaluate_policy(model, tokenizer, puzzles, config, mode="greedy", oracle=Non
             len(first),
         )
         metrics["oracle_states"] = len(first)
-    if rows:
+    if rows and probability_metrics:
         predictions = predict_rows(
             model,
             tokenizer,
@@ -167,7 +178,7 @@ def run(config, output, model=None, tokenizer=None):
         raise ValueError("The generated dataset is empty")
 
     if model is None:
-        model = JevModel.load_base(config).float().cuda()
+        model = JevModel.load_base(config).cuda()
     if tokenizer is None:
         tokenizer = load_tokenizer(config["base_model"])
     device = next(model.parameters()).device
@@ -199,6 +210,17 @@ def run(config, output, model=None, tokenizer=None):
         ),
     )
     (output / "resolved_config.yaml").write_text(yaml.safe_dump(config))
+    print(
+        json.dumps(
+            dict(
+                resolved_config=config,
+                base_model=config["base_model"],
+                seed=config["seed"],
+                objective=config["objective"],
+            )
+        ),
+        flush=True,
+    )
     micro = config["microbatch"]
     summaries = []
     started = time.monotonic()
@@ -219,9 +241,27 @@ def run(config, output, model=None, tokenizer=None):
                 generation,
                 mode=config["rollout_mode"],
             )
+            frozen_dev = dict(
+                frozen,
+                rollouts_per_puzzle=config["validation_rollouts_per_puzzle"],
+            )
+            dev_records, dev_rows, dev_rollout_metrics = collect(
+                model,
+                tokenizer,
+                dev_puzzles,
+                frozen_dev,
+                generation,
+                mode=config["rollout_mode"],
+            )
             write_jsonl(folder / "trajectories.jsonl", [record_json(r) for r in records])
             write_jsonl(folder / "rows.jsonl", rows)
             save_json(folder / "rollout_metrics.json", rollout_metrics)
+            write_jsonl(
+                folder / "frozen_dev_trajectories.jsonl",
+                [record_json(record) for record in dev_records],
+            )
+            write_jsonl(folder / "frozen_dev_rows.jsonl", dev_rows)
+            save_json(folder / "frozen_dev_rollout_metrics.json", dev_rollout_metrics)
             if not rows:
                 raise RuntimeError("Generation produced no training rows")
             batch_rng = random.Random(stream_seed(config["seed"], "batch", generation))
@@ -242,18 +282,36 @@ def run(config, output, model=None, tokenizer=None):
                 log.write(json.dumps(record) + "\n")
                 log.flush()
                 print(json.dumps(record), flush=True)
-            dev_records, dev_rows, dev_metrics = evaluate_policy(
-                model, tokenizer, dev_puzzles, frozen, mode="greedy", oracle=oracle
+            dev_calibration = evaluate_observed_rows(
+                model, tokenizer, dev_rows, frozen, oracle=oracle
             )
-            write_jsonl(folder / "dev_rows.jsonl", dev_rows)
-            save_json(folder / "dev_metrics.json", dev_metrics)
-            plot_reliability(dev_metrics, f"{output.name}_gen{generation:03d}")
+            controller = generation_config(config, generation + 1)
+            controller_records, _, dev_controller = evaluate_policy(
+                model,
+                tokenizer,
+                dev_puzzles,
+                controller,
+                mode="greedy",
+                oracle=oracle,
+                probability_metrics=False,
+            )
+            write_jsonl(
+                folder / "dev_controller_trajectories.jsonl",
+                [record_json(record) for record in controller_records],
+            )
+            save_json(folder / "dev_calibration_metrics.json", dev_calibration)
+            save_json(folder / "dev_controller_metrics.json", dev_controller)
+            plot_reliability(dev_calibration, f"{output.name}_gen{generation:03d}")
             summary = dict(
                 generation=generation,
                 policy_id=frozen["policy_id"],
                 solver_mix=frozen["solver_mix"],
                 rollout=rollout_metrics,
-                dev={key: value for key, value in dev_metrics.items() if key != "events"},
+                frozen_dev_rollout=dev_rollout_metrics,
+                dev_calibration={
+                    key: value for key, value in dev_calibration.items() if key != "events"
+                },
+                dev_controller=dev_controller,
                 mean_loss=float(np.mean([record["loss"] for record in step_records])),
                 mean_gradient_norm=float(
                     np.mean([record["gradient_norm"] for record in step_records])
@@ -266,12 +324,20 @@ def run(config, output, model=None, tokenizer=None):
             atomic_checkpoint(
                 output / "checkpoint.pt",
                 model,
-                dict(config, policy_id=frozen["policy_id"]),
+                dict(
+                    config,
+                    policy_id=controller["policy_id"],
+                    solver_mix=controller["solver_mix"],
+                ),
                 optimizer=optimizer.state_dict(),
                 scheduler=scheduler.state_dict(),
                 step=(generation + 1) * config["steps_per_generation"],
                 generation=generation,
-                metadata=dict(device=device.type, dev=summary["dev"]),
+                metadata=dict(
+                    device=device.type,
+                    dev_calibration=summary["dev_calibration"],
+                    dev_controller=summary["dev_controller"],
+                ),
             )
             print(json.dumps(dict(generation_complete=summary)), flush=True)
     finally:
@@ -282,9 +348,13 @@ def run(config, output, model=None, tokenizer=None):
             generations=len(summaries),
             train_puzzles=len(train_puzzles),
             dev_puzzles=len(dev_puzzles),
-            final_dev=summaries[-1]["dev"] if summaries else None,
+            final_dev_calibration=(
+                summaries[-1]["dev_calibration"] if summaries else None
+            ),
+            final_dev_controller=summaries[-1]["dev_controller"] if summaries else None,
             best_dev_solved_rate=max(
-                (summary["dev"]["solved_rate"] for summary in summaries), default=None
+                (summary["dev_controller"]["solved_rate"] for summary in summaries),
+                default=None,
             ),
             seconds=time.monotonic() - started,
         ),
@@ -300,7 +370,7 @@ def learning_rate_scale(step, total_steps, warmup_steps):
 
 
 def evaluate_test(run, model=None, tokenizer=None):
-    """Final evaluation on the test split and the unsolvable robustness set."""
+    """Separate sampled-policy calibration from greedy controller performance."""
     require_slurm()
     output = Path(run)
     model, saved = load_checkpoint(output / "checkpoint.pt")
@@ -316,20 +386,50 @@ def evaluate_test(run, model=None, tokenizer=None):
         puzzles = load_puzzles(data_root / filename)
         if limit is not None:
             puzzles = puzzles[:limit]
-        records, rows, metrics = evaluate_policy(
-            model, tokenizer, puzzles, config, mode="greedy", oracle=oracle
+        calibration_config = dict(
+            config,
+            rollouts_per_puzzle=config["test_rollouts_per_puzzle"],
+            solver_mix=0.0,
         )
-        metrics["reached_target_rate"] = rate(
-            sum(record["solved"] for record in records), len(records)
+        frozen_records, frozen_rows, frozen_rollout = collect(
+            model,
+            tokenizer,
+            puzzles,
+            calibration_config,
+            saved.get("generation", -1) + 1,
+            mode=config["rollout_mode"],
         )
-        metrics["solver_step_share"] = rate(
-            sum(step["controller"] == "solver" for record in records for step in record["steps"]),
-            sum(len(record["steps"]) for record in records),
+        calibration = evaluate_observed_rows(
+            model, tokenizer, frozen_rows, calibration_config, oracle=oracle
         )
-        write_jsonl(output / f"{name}_trajectories.jsonl", [record_json(r) for r in records])
-        write_jsonl(output / f"{name}_rows.jsonl", rows)
-        save_json(output / f"{name}_metrics.json", metrics)
-        report[name] = {key: value for key, value in metrics.items() if key != "events"}
+        controller_records, _, controller = evaluate_policy(
+            model,
+            tokenizer,
+            puzzles,
+            dict(config, solver_mix=0.0),
+            mode="greedy",
+            oracle=oracle,
+            probability_metrics=False,
+        )
+        write_jsonl(
+            output / f"{name}_frozen_trajectories.jsonl",
+            [record_json(record) for record in frozen_records],
+        )
+        write_jsonl(output / f"{name}_frozen_rows.jsonl", frozen_rows)
+        write_jsonl(
+            output / f"{name}_controller_trajectories.jsonl",
+            [record_json(record) for record in controller_records],
+        )
+        save_json(output / f"{name}_frozen_rollout_metrics.json", frozen_rollout)
+        save_json(output / f"{name}_calibration_metrics.json", calibration)
+        save_json(output / f"{name}_controller_metrics.json", controller)
+        report[name] = dict(
+            calibration={
+                key: value for key, value in calibration.items() if key != "events"
+            },
+            controller=controller,
+            frozen_rollout=frozen_rollout,
+        )
     save_json(output / "test_report.json", report)
     return report
 

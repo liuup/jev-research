@@ -13,6 +13,10 @@ reward_samples: 32
 generations: 30
 puzzles_per_generation: 954
 rollouts_per_puzzle: 4
+# Calibration events are collected before each generation update with exactly the
+# same frozen sampled continuation policy. Controller evaluation is reported separately.
+validation_rollouts_per_puzzle: 4
+test_rollouts_per_puzzle: 4
 steps_per_generation: 300
 effective_batch: 64
 microbatch: 32

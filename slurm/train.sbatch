@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # One full 24 game RLCD run, then the test evaluation.
-#SBATCH --job-name=24game-train
+#SBATCH --job-name=24game-pg-s17
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=24
 #SBATCH --mem=48G

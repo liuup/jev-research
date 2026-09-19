@@ -1,5 +1,6 @@
 """Rollouts: determinism, lockstep episodes, the solver-mixed pi0 and row labelling."""
 
+import random
 from pathlib import Path
 
 import pytest
@@ -55,8 +56,6 @@ def test_action_distribution_normalizes_success_probabilities():
 
 
 def test_choose_is_reproducible_and_greedy_picks_the_best():
-    import random
-
     actions = State.initial(puzzles(1)[0]).actions()
     distribution = {action["key"]: 1 / len(actions) for action in actions}
     first = choose(distribution, actions, random.Random(3), "sample")
@@ -117,20 +116,21 @@ def test_greedy_rollouts_are_deterministic_and_sample_mode_explores():
     assert len(set(sampled)) > len({step["chosen"] for r in greedy_a for step in r["steps"]})
 
 
-def test_training_rows_keep_one_outcome_per_state_and_action():
+def test_training_rows_keep_every_independent_outcome_event():
     state = State.initial(puzzles(1)[0])
     action = state.actions()[0]
     step = dict(state=state, action=action, chosen=action["key"], controller="model")
     records = [
-        dict(puzzle=state.puzzle, solved=True, steps=[step]),
-        dict(puzzle=state.puzzle, solved=False, steps=[step]),
-        dict(puzzle=state.puzzle, solved=True, steps=[step]),
+        dict(puzzle=state.puzzle, rollout_seed=1, solved=True, steps=[step]),
+        dict(puzzle=state.puzzle, rollout_seed=2, solved=False, steps=[step]),
+        dict(puzzle=state.puzzle, rollout_seed=3, solved=True, steps=[step]),
     ]
-    rows, duplicates = training_rows(records, "24game:seed17:g0")
-    assert len(rows) == 1 and duplicates == 2
-    assert rows[0]["observed_outcome"] == "yes"
-    assert rows[0]["candidate_ids"] == ["yes", "no"]
-    assert rows[0]["state_id"] == state.state_id()
+    rows, repeated = training_rows(records, "24game:seed17:g0")
+    assert len(rows) == 3 and repeated == 2
+    assert [row["observed_outcome"] for row in rows] == ["yes", "no", "yes"]
+    assert len({row["event_id"] for row in rows}) == 3
+    assert all(row["candidate_ids"] == ["yes", "no"] for row in rows)
+    assert all(row["state_id"] == state.state_id() for row in rows)
 
 
 def test_collect_reports_labels_consistent_with_the_trajectories():
@@ -140,7 +140,8 @@ def test_collect_reports_labels_consistent_with_the_trajectories():
     )
     assert metrics["rollouts"] == 16
     assert metrics["training_rows"] == len(rows)
-    assert metrics["duplicate_rows"] >= 0
+    assert metrics["repeated_state_action_events"] >= 0
+    assert metrics["training_rows"] == metrics["states_visited"]
     assert 0.0 <= metrics["solved_rate"] <= 1.0
     assert 0.0 <= metrics["solver_step_share"] <= 1.0
     for row in rows:
@@ -154,6 +155,8 @@ def test_collect_reports_labels_consistent_with_the_trajectories():
 
 def _trajectory_solved(records, row):
     for record in records:
+        if record["rollout_seed"] != row["rollout_seed"]:
+            continue
         for step in record["steps"]:
             if step["state"].state_id() == row["state_id"] and step["chosen"] == row["action_key"]:
                 return record["solved"]
@@ -161,11 +164,7 @@ def _trajectory_solved(records, row):
 
 
 def test_pick_action_falls_back_to_the_model_when_nothing_is_solvable():
-    import random
-
-    from jevmath.puzzles import load_puzzles as _load
-
-    unsolvable = _load(DATA / "unsolvable.jsonl")[0]
+    unsolvable = load_puzzles(DATA / "unsolvable.jsonl")[0]
     state = State.initial(unsolvable)
     actions = state.actions()
     probabilities = {action["key"]: 0.5 for action in actions}

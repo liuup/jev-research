@@ -58,7 +58,7 @@ def serialize(row):
         + ("(none)" if not history else "\n".join(
             f"{index + 1}. {text}" for index, text in enumerate(history)
         ))
-        + f"\n\nFrozenPolicy: {row['policy_id']}\n\n"
+        + "\n\n[CONTINUATION]\nUse the frozen continuation policy.\n\n"
         f"[ACTION]\n{row['action_text']}\n\n"
         "[QUESTION]\nIf this action is performed now and the frozen policy continues, "
         f"will the final value equal {row['target']} after "

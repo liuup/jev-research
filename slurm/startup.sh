@@ -9,3 +9,4 @@ git rev-parse HEAD
 echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-unset}"
 nvidia-smi
 uv run python --version
+uv --version

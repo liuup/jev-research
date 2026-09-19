@@ -74,7 +74,8 @@ Remaining: 8/3 3 8
 Steps already taken:
 1. 8 / 3 = 8/3
 
-FrozenPolicy: 24game:seed17:solver0.5:g0
+[CONTINUATION]
+Use the frozen continuation policy.
 
 [ACTION]
 3 - 8/3 = 1/3
@@ -90,9 +91,9 @@ NO
 YES
 ```
 
-模型对每个动作输出 `P(YES)`，控制器取最大者（评估）或按归一化后的 `P(YES)` 采样
-（采集）。prompt 里的 `FrozenPolicy` 标明这批标签是在哪个冻结策略下产生的，训练、dev、
-test 三处使用同一个字符串，避免分布外输入。
+模型对每个动作输出 `P(YES)`，控制器取最大者（控制评估）或按归一化后的 `P(YES)` 采样
+（采集）。具体 `policy_id` 只保存在数据和日志元数据中，不写入 prompt，避免每一代出现从未训练过的
+任意 ID token。
 
 ## 4. 在线 RLCD 循环
 
@@ -100,16 +101,17 @@ test 三处使用同一个字符串，避免分布外输入。
 
 1. 冻结当前策略，给它一个 `policy_id`（`24game:seed17:g{generation}`）；
 2. 从 train 里抽 `puzzles_per_generation` 道题，每题跑 `rollouts_per_puzzle` 次 rollout；
-3. 每条 rollout 记录访问过的每个 `(state, action)`，**同一个 `(state, action)` 只保留一次**
-   观测结果（本轮内去重，重复条数计入 `duplicate_rows`）；
-4. 用 paired proper-reward PG 更新模型 `steps_per_generation` 步；
-5. 训练前已经完成全部采集，learner 无法影响自己这一代的标签；
-6. 代末在 dev 上做贪心评估并保存 checkpoint，最后在 test 与不可解题集上做一次终评。
+3. 每次 rollout 的每个 `(state, action)` 都保存为独立事件；相同输入出现不同 YES/NO 是估计
+   随机成功概率所需的信息，不能去重；
+4. 更新前使用同一个 frozen sampled policy 采集独立 dev 事件；
+5. 用 paired proper-reward PG 更新模型 `steps_per_generation` 步；
+6. 在固定 dev 事件上计算 NLL/Brier/ECE，另行用 greedy controller 报告成功率；
+7. learner 无法影响本代 train/dev 标签，校准指标和控制指标不会混用。
 
 **π0 的设定。** 全随机或完全未训练的策略成功率过低，会让标签几乎全是 `NO`。因此第 0 代用
 `init_policy: solver_mix`：每一步以 `init_solver_mix` 的概率交给求解器（在「执行后仍可解」的
-动作里等概率选一个），否则交给模型。第 1 代起完全由模型自己续玩，`FrozenPolicy` 也随之变成
-`g1`。求解器只在第 0 代以这个方式参与数据生成，之后不再出现。
+动作里等概率选一个），否则交给模型。第 1 代起完全由模型自己续玩。求解器只在第 0 代以这个
+方式参与数据生成，之后不再出现。
 
 ## 5. 实测性能与超参数
 
@@ -128,8 +130,8 @@ test 三处使用同一个字符串，避免分布外输入。
 - **bf16 比 fp32 快 2.4 倍**，显存相同，因此 `inference_precision: bf16` 成为默认；
 - 前向吞吐从 16 题起就进入平台（499→504 题/s），题数只影响显存，`inference_questions: 32`
   在平台上同时减少调用次数；
-- 训练显存的地板是 14 GiB（fp32 参数 3 GB + AdamW 状态 6 GB + 梯度 3 GB + 激活），
-  microbatch 从 4 加到 128 都不变，吞吐在 microbatch 16 之后到平台。
+- 当前实现保持 Qwen backbone 为 BF16、决策头为 FP32；旧的 FP32-master 训练显存数字不再作为
+  正式依据，提交主实验前应重新运行 benchmark。
 
 按上表，正式配置（`configs/train.yaml`）与预算：
 
@@ -137,9 +139,8 @@ test 三处使用同一个字符串，避免分布外输入。
 | --- | --- | --- |
 | 收集 | 954 题 × 4 次 rollout × 3 步 = 11,448 个状态 ≈ 23 万个候选问题 | 约 9 分钟 |
 | 训练 | 300 步 × 64 行 = 19,200 次行前向 | 约 3 分钟 |
-| dev 评估 + checkpoint | 204 题贪心 + 8.6 GB 写盘 | 约 1 分钟 |
-| **每代合计** | | **约 13 分钟** |
-| 30 代 + 终评 | | **约 7 小时** |
+| frozen dev 采集 + greedy controller + checkpoint | 204 题 × 4 次 sampled，另加 204 题 greedy | 需以新 smoke 实测 |
+| **每代合计** | | **修复后重新测量** |
 
 ## 6. 运行
 
@@ -166,16 +167,17 @@ runs/<name>/
 ├── training.jsonl               每一步的 loss、梯度范数、校准诊断
 ├── generation_XXX/
 │   ├── trajectories.jsonl       每条轨迹的动作、分布、熵、控制器
-│   ├── rows.jsonl               去重后的训练行（一条一个观测结果）
+│   ├── rows.jsonl               每次 rollout 的独立观测事件，包含 event_id
 │   ├── rollout_metrics.json     成功率、YES 比例、平均 P(YES)、动作熵、solver 占比
-│   ├── dev_rows.jsonl / dev_metrics.json
+│   ├── frozen_dev_rows.jsonl / dev_calibration_metrics.json
+│   └── dev_controller_metrics.json
 ├── generations.json / summary.json / checkpoint.pt（8.6 GB，每代覆盖）
 └── test_metrics.json / unsolvable_metrics.json / test_report.json
 ```
 
 指标口径：
 
-- `solved_rate`、`first_action_solvable_rate`：贪心成功率，以及第一步是否保持可解（oracle）；
+- `dev_controller.solved_rate`、`first_action_solvable_rate`：贪心成功率与第一步是否保持可解；
 - `yes_rate`：这批行里观测结果为 YES 的比例；
 - `binary_brier`、`observed_nll`、`ece_ge_correct`、`mean_prediction_entropy`：校准；
   `observed_brier` 是两类求和的多类 Brier，等于 `binary_brier` 的两倍，报表以 `binary_brier` 为准；
@@ -192,4 +194,4 @@ runs/<name>/
   自身策略，跨代比较成功率时要注意这一点。
 - 4 个数字固定三步运算，没有 STOP，所以「最终值」只在轨迹结束时存在，事件定义是
   「三步之后的值等于 24」，不存在中途报告答案的情形。
-- dev 指标按行聚合，同一条轨迹的多行共享标签，有效样本量接近题数（204）而非行数。
+- 校准事件来自 frozen sampled policy；同一条轨迹的三行共享结果，置信区间应按 trajectory 聚类。

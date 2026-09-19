@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from jevmath.env import State
 from jevmath.puzzles import (
     SOLVABLE,
     SPLIT_SIZES,
@@ -13,16 +14,26 @@ from jevmath.puzzles import (
     build_puzzles,
     canonical_key,
     evaluate_expression,
+    expression_solutions,
     first_step_actions,
     hands,
     is_solvable,
+    load_puzzles,
     puzzle_id,
+    render,
     solution_strings,
     split_puzzles,
+    verify_manifest,
     write_dataset,
 )
 
 DATA = Path("data/24game")
+
+
+def expression_leaves(expression):
+    if expression[0] == "num":
+        return [expression[1]]
+    return expression_leaves(expression[2]) + expression_leaves(expression[3])
 
 
 def test_hand_space_matches_the_plan():
@@ -45,8 +56,11 @@ def test_solvable_counts_match_the_plan():
 def test_every_solution_evaluates_to_the_target():
     checked = 0
     for hand in hands():
-        for solution in solution_strings(hand):
+        expected = Counter(Fraction(value) for value in hand)
+        for expression in expression_solutions(hand):
+            solution = render(expression)
             assert evaluate_expression(solution) == 24, (hand, solution)
+            assert Counter(expression_leaves(expression)) == expected, (hand, solution)
             checked += 1
     assert checked > 1_000
 
@@ -89,8 +103,6 @@ def test_actions_are_deduplicated_and_skip_division_by_zero():
     assert keys.count("-:1:1") == 1
     assert keys.count("/:1:1") == 1
     assert keys.count("*:1:1") == 1
-    from jevmath.env import State
-
     state = State.initial(dict(puzzle_id="x", numbers=[1, 1, 2, 3], target=24))
     zero = state.apply(next(a for a in state.actions() if a["key"] == "-:1:1"))
     assert zero.values == (0, 2, 3)
@@ -130,8 +142,6 @@ def test_generated_files_match_the_manifest(tmp_path):
     assert manifest["rules"]["operations_per_episode"] == 3
     for name in ("train.jsonl", "dev.jsonl", "test.jsonl", "unsolvable.jsonl", "oracle_actions.jsonl"):
         assert (tmp_path / name).exists(), name
-    from jevmath.puzzles import verify_manifest
-
     verify_manifest(tmp_path, manifest)
     (tmp_path / "train.jsonl").write_text("")
     with pytest.raises(ValueError, match="manifest"):
@@ -140,8 +150,6 @@ def test_generated_files_match_the_manifest(tmp_path):
 
 @pytest.mark.skipif(not (DATA / "manifest.json").exists(), reason="dataset not built")
 def test_repository_dataset_is_intact():
-    from jevmath.puzzles import load_puzzles, verify_manifest
-
     manifest = verify_manifest(DATA)
     train = load_puzzles(DATA / "train.jsonl")
     dev = load_puzzles(DATA / "dev.jsonl")

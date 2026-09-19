@@ -28,7 +28,8 @@ def test_prompt_states_target_remaining_action_and_policy():
     assert "[STATE]" in text and "Target: 24" in text
     assert "Remaining: 3 3 8 8" in text
     assert "Steps already taken:\n(none)" in text
-    assert "FrozenPolicy: 24game:seed17:g0" in text
+    assert "[CONTINUATION]\nUse the frozen continuation policy." in text
+    assert "24game:seed17:g0" not in text
     assert "[ACTION]\n8 / 3 = 8/3" in text
     assert "will the final value equal 24" in text
     assert "[OPTIONS]\nYES\nNO" in text

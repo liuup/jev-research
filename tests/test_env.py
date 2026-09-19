@@ -5,7 +5,7 @@ from fractions import Fraction
 import pytest
 
 from jevmath.env import ActionError, State, action_key, solved_after
-from jevmath.puzzles import is_solvable
+from jevmath.puzzles import apply_op, is_solvable
 
 
 def puzzle(numbers, target=24):
@@ -66,8 +66,6 @@ def test_division_by_zero_is_never_offered():
     assert Fraction(0) in zero.values
     assert all(a["right"] != 0 for a in zero.actions() if a["op"] == "/")
     with pytest.raises(ZeroDivisionError):
-        from jevmath.puzzles import apply_op
-
         apply_op("/", Fraction(1), Fraction(0))
 
 

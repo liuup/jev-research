@@ -3,6 +3,8 @@ inherit: train.yaml
 generations: 1
 puzzles_per_generation: 16
 rollouts_per_puzzle: 2
+validation_rollouts_per_puzzle: 2
+test_rollouts_per_puzzle: 2
 steps_per_generation: 10
 effective_batch: 8
 microbatch: 4

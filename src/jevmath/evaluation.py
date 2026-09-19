@@ -167,6 +167,22 @@ def oracle_separation(predictions, rows, oracle):
     )
 
 
+def evaluate_observed_rows(model, tokenizer, rows, config, oracle=None):
+    """Score fixed events collected under a frozen continuation policy."""
+    predictions = predict_rows(
+        model,
+        tokenizer,
+        rows,
+        microbatch=config["inference_questions"],
+        max_length=config["max_length"],
+        precision=config["inference_precision"],
+    )
+    metrics = observed_metrics(predictions, rows) | risk_coverage(predictions, rows)
+    if oracle is not None:
+        metrics["oracle_separation"] = oracle_separation(predictions, rows, oracle)
+    return metrics
+
+
 def plot_reliability(metrics, name):
     Path("results/plots").mkdir(parents=True, exist_ok=True)
     figure = Figure(figsize=(5, 4))

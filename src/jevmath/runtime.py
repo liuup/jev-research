@@ -29,6 +29,6 @@ def atomic_checkpoint(path, model, config, **extra):
 def load_checkpoint(path):
     require_slurm()
     saved = torch.load(path, map_location="cpu", weights_only=False, mmap=True)
-    model = JevModel.load_base(saved["config"]).float()
+    model = JevModel.load_base(saved["config"])
     model.load_state_dict(saved["model"], strict=True)
     return model.cuda(), saved

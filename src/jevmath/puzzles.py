@@ -120,31 +120,57 @@ def canonical(expression):
     return ("op", op, left, right)
 
 
-def substitute(expression, value, replacement):
-    """Replace every leaf equal to ``value`` with a subexpression of the same value."""
-    if expression[0] == "num":
-        return replacement if expression[1] == value else expression
-    _, op, left, right = expression
-    return ("op", op, substitute(left, value, replacement), substitute(right, value, replacement))
-
-
 def expression_solutions(values, target=TARGET, _memo=None):
-    """Every way to reach the target, as canonical expression tuples."""
-    memo = {} if _memo is None else _memo
-    state = tuple(sorted(Fraction(value) for value in values))
-    if state in memo:
-        return memo[state]
-    if len(state) == 1:
-        memo[state] = {("num", state[0])} if state[0] == target else set()
-        return memo[state]
-    found = set()
-    for op, left, right in operations(state):
-        result = apply_op(op, left, right)
-        node = ("op", op, ("num", left), ("num", right))
-        for tail in expression_solutions(_remainder(state, left, right, result), target, memo):
-            found.add(canonical(substitute(tail, result, node)))
-    memo[state] = found
-    return found
+    """Every valid expression reaching the target, with each input leaf used once.
+
+    A value-only reconstruction is ambiguous when an intermediate result equals an
+    unrelated remaining input.  This subset dynamic program retains expression
+    provenance, so it cannot accidentally replace multiple equal-valued leaves.
+    """
+    del _memo  # Kept in the signature for compatibility with older callers.
+    numbers = tuple(Fraction(value) for value in values)
+    by_subset = {
+        1 << index: {value: {("num", value)}}
+        for index, value in enumerate(numbers)
+    }
+    full = (1 << len(numbers)) - 1
+    for mask in range(1, full + 1):
+        if mask in by_subset:
+            continue
+        table = {}
+        left_mask = (mask - 1) & mask
+        while left_mask:
+            right_mask = mask ^ left_mask
+            if right_mask and left_mask < right_mask:
+                for left_value, left_nodes in by_subset[left_mask].items():
+                    for right_value, right_nodes in by_subset[right_mask].items():
+                        candidates = [
+                            ("+", left_value, right_value, left_nodes, right_nodes),
+                            ("*", left_value, right_value, left_nodes, right_nodes),
+                            ("-", left_value, right_value, left_nodes, right_nodes),
+                            ("-", right_value, left_value, right_nodes, left_nodes),
+                        ]
+                        if right_value != 0:
+                            candidates.append(
+                                ("/", left_value, right_value, left_nodes, right_nodes)
+                            )
+                        if left_value != 0:
+                            candidates.append(
+                                ("/", right_value, left_value, right_nodes, left_nodes)
+                            )
+                        for op, left, right, left_expressions, right_expressions in candidates:
+                            result = apply_op(op, left, right)
+                            expressions = table.setdefault(result, set())
+                            for left_expression in left_expressions:
+                                for right_expression in right_expressions:
+                                    expressions.add(
+                                        canonical(
+                                            ("op", op, left_expression, right_expression)
+                                        )
+                                    )
+            left_mask = (left_mask - 1) & mask
+        by_subset[mask] = table
+    return by_subset[full].get(Fraction(target), set())
 
 
 def solution_strings(values, target=TARGET):
@@ -275,9 +301,15 @@ def _split_hash(puzzles):
 
 def _code_version():
     try:
-        return subprocess.check_output(
+        commit = subprocess.check_output(
             ["git", "rev-parse", "HEAD"], text=True, stderr=subprocess.DEVNULL
         ).strip()
+        dirty = subprocess.check_output(
+            ["git", "status", "--porcelain", "--untracked-files=no"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+        return f"{commit}+dirty" if dirty else commit
     except (subprocess.CalledProcessError, FileNotFoundError):
         return "unknown"
 

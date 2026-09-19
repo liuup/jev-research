@@ -1,6 +1,7 @@
 """Metrics, oracle separation and the full generation loop on CPU with the tiny model."""
 
 import json
+import random
 from pathlib import Path
 
 import numpy as np
@@ -136,8 +137,6 @@ def test_config_validation_rejects_bad_values():
 
 
 def test_sample_puzzles_is_deterministic_and_handles_all_train_puzzles():
-    import random
-
     train = load_puzzles(DATA / "train.jsonl")
     first = sample_puzzles(train, 8, random.Random(1))
     assert first == sample_puzzles(train, 8, random.Random(1))
@@ -152,15 +151,19 @@ def test_generation_runs_end_to_end_on_cpu(tmp_path):
     summaries = run(config, tmp_path / "run", model=model, tokenizer=tokenizer)
     assert len(summaries) == 1
     summary = summaries[0]
-    rollout, dev = summary["rollout"], summary["dev"]
+    rollout = summary["rollout"]
+    dev = summary["dev_calibration"]
+    controller = summary["dev_controller"]
     assert rollout["puzzles"] == 8 and rollout["rollouts"] == 16
     assert rollout["training_rows"] > 0
     assert 0.0 <= rollout["row_yes_rate"] <= 1.0
-    assert dev["puzzles"] == 4
-    assert 0.0 <= dev["solved_rate"] <= 1.0
+    assert summary["frozen_dev_rollout"]["puzzles"] == 4
+    assert summary["frozen_dev_rollout"]["rollouts"] == 8
+    assert 0.0 <= summary["frozen_dev_rollout"]["solved_rate"] <= 1.0
     assert dev["questions"] > 0
     assert 0.0 <= dev["binary_brier"] <= 2.0
     assert dev["oracle_separation"]["separation"] is None or -1 <= dev["oracle_separation"]["separation"] <= 1
+    assert 0.0 <= controller["solved_rate"] <= 1.0
     steps = [
         json.loads(line)
         for line in (tmp_path / "run" / "training.jsonl").read_text().splitlines()

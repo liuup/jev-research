@@ -1,44 +1,65 @@
 import numpy as np
 import pytest
 
-from jev2048.evaluation import mc_metrics, observed_metrics, reliability
-from jev2048.serialization import OUTCOMES
+from jevmath.evaluation import (
+    action_ranking,
+    observed_metrics,
+    reliability,
+    risk_coverage,
+)
 
 
-def test_perfect_predictions():
-    p = np.eye(7)
-    rows = [
-        dict(observed_outcome=o, q=p[i].tolist(), rollouts=256)
-        for i, o in enumerate(OUTCOMES)
-    ]
-    result = observed_metrics(p, rows)
-    assert (
-        result["top1_accuracy"] == 1
-        and result["observed_nll"] == 0
-        and result["observed_brier"] == 0
-    )
-    assert result["ece_ge2048"] == 0
-    assert result["expected_log_tile_mean_bias"] == 0
-    assert result["expected_log_tile_mean_absolute_bias"] == 0
-    assert "observed_log_tile_mae" not in result
-    assert "observed_log_tile_mse" not in result
-    mc = mc_metrics(p, rows)
-    assert mc["mc_squared_l2"] == 0
-    assert mc["mc_js"] == 0
-    assert mc["mc_expected_log_tile_mae"] == 0
+def rows_from(events):
+    return [dict(candidate_ids=["yes", "no"], observed_outcome=event) for event in events]
 
 
-def test_observed_metrics_report_mean_bias_not_single_event_utility_error():
-    p = np.full((2, 7), 1 / 7)
-    rows = [dict(observed_outcome="512"), dict(observed_outcome="1024")]
-    result = observed_metrics(p, rows)
-    assert result["predicted_expected_log_tile"] == pytest.approx(10)
-    assert result["observed_mean_log_tile"] == pytest.approx(9.5)
-    assert result["expected_log_tile_mean_bias"] == pytest.approx(0.5)
-    assert result["expected_log_tile_mean_absolute_bias"] == pytest.approx(0.5)
+def test_perfect_predictions_score_zero():
+    predictions = np.array([[1.0, 0.0], [0.0, 1.0]])
+    result = observed_metrics(predictions, rows_from(["yes", "no"]))
+    assert result["top1_accuracy"] == 1
+    assert result["observed_nll"] == pytest.approx(0)
+    assert result["observed_brier"] == pytest.approx(0)
+    assert result["binary_brier"] == pytest.approx(0)
+    assert result["ece_ge_correct"] == pytest.approx(0)
+    assert result["mean_entropy"] == pytest.approx(0)
 
 
-def test_bin_boundaries():
-    ece, rows = reliability(np.array([0.0, 0.1, 1.0]), np.array([0.0, 1.0, 1.0]))
-    assert [rows[i]["count"] for i in (0, 1, 9)] == [1, 1, 1]
-    assert ece == pytest.approx(0.3)
+def test_vector_brier_is_twice_the_scalar_brier():
+    predictions = np.array([[0.8, 0.2], [0.3, 0.7]])
+    result = observed_metrics(predictions, rows_from(["yes", "no"]))
+    assert result["observed_brier"] == pytest.approx(2 * result["binary_brier"])
+    assert result["predicted_success_probability"] == pytest.approx(0.55)
+    assert result["observed_success_rate"] == pytest.approx(0.5)
+
+
+def test_reliability_bins_and_ece():
+    probability = np.array([0.05, 0.15, 0.95])
+    event = np.array([0.0, 0.0, 1.0])
+    ece, diagram = reliability(probability, event)
+    occupied = [row for row in diagram if row["count"]]
+    assert len(occupied) == 3
+    assert occupied[0]["probability"] == pytest.approx(0.05)
+    assert occupied[0]["frequency"] == pytest.approx(0.0)
+    assert ece == pytest.approx((0.05 + 0.15 + 0.05) / 3)
+
+
+def test_risk_coverage_prefers_confident_rows():
+    predictions = np.array([[0.99, 0.01], [0.01, 0.99], [0.5, 0.5], [0.6, 0.4]])
+    rows = rows_from(["yes", "no", "yes", "no"])
+    result = risk_coverage(predictions, rows, points=4)
+    assert result["curve"][0]["coverage"] == pytest.approx(0.25)
+    assert result["curve"][0]["accuracy"] == pytest.approx(1.0)
+    assert result["curve"][-1]["accuracy"] == pytest.approx(0.5)
+    assert result["mean_confidence"] > 0.5
+    assert result["aurc"] > 0
+
+
+def test_action_ranking_agreement_and_regret():
+    model = [{"a": 0.9, "b": 0.1}, {"a": 0.2, "b": 0.8}]
+    reference = [{"a": 0.9, "b": 0.1}, {"a": 0.9, "b": 0.1}]
+    result = action_ranking(model, reference)
+    assert result["states"] == 2
+    assert result["action_agreement"] == pytest.approx(0.5)
+    assert result["action_regret"] == pytest.approx(0.4)
+    with pytest.raises(ValueError):
+        action_ranking(model, reference[:1])

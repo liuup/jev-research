@@ -1,87 +1,102 @@
-from collections import Counter
+from fractions import Fraction
 
 import pytest
 
-from jev2048.env import ACTIONS, Game, merge, moved
-from jev2048.heuristic import HeuristicPolicy
+from jevmath.env import CandidateError, State, apply_op, forced_stop_value
+from jevmath.gsm8k import final_answer, question_numbers
 
-
-@pytest.mark.parametrize(
-    "row,out,score",
-    [
-        ([2, 2, 2, 2], [4, 4, 0, 0], 8),
-        ([4, 4, 8, 8], [8, 16, 0, 0], 24),
-        ([2, 2, 4, 0], [4, 4, 0, 0], 4),
-        ([4, 0, 4, 4], [8, 4, 0, 0], 8),
-        ([0, 0, 0, 0], [0, 0, 0, 0], 0),
-        ([2, 4, 8, 16], [2, 4, 8, 16], 0),
-        ([2, 2, 4, 4], [4, 8, 0, 0], 12),
-        ([2, 0, 0, 2], [4, 0, 0, 0], 4),
-    ],
+ROW = dict(
+    id="demo",
+    question="Ann has 3 apples and buys 4 more, then gives away 2.",
+    numbers=((Fraction(3), "q1"), (Fraction(4), "q2"), (Fraction(2), "q3")),
+    gold=Fraction(5),
 )
-def test_merge(row, out, score):
-    assert merge(tuple(row)) == (tuple(out), score)
 
 
-@pytest.mark.parametrize("action", ACTIONS)
-def test_directions(action):
-    board = ((2, 2, 0, 0),) * 4
-    b, s = moved(board, action)
-    assert s == 16
-    assert sum(map(sum, b)) == sum(map(sum, board))
-    if action == "LEFT":
-        assert b[0] == (4, 0, 0, 0)
-    if action == "RIGHT":
-        assert b[0] == (0, 0, 0, 4)
-    if action == "UP":
-        assert b[0] == (4, 4, 0, 0) and b[3] == (0, 0, 0, 0)
-    if action == "DOWN":
-        assert b[3] == (4, 4, 0, 0) and b[0] == (0, 0, 0, 0)
+def test_calculator_operations():
+    assert apply_op("ADD", Fraction(3), Fraction(4)) == 7
+    assert apply_op("SUB", Fraction(3), Fraction(4)) == -1
+    assert apply_op("MUL", Fraction(3), Fraction(4)) == 12
+    assert apply_op("DIV", Fraction(6), Fraction(4)) == Fraction(3, 2)
+    with pytest.raises(ZeroDivisionError):
+        apply_op("DIV", Fraction(1), Fraction(0))
+    with pytest.raises(CandidateError):
+        apply_op("POW", Fraction(1), Fraction(1))
 
 
-def test_seed_clone_invalid_terminal():
-    a, b = Game(17), Game(17)
-    p = HeuristicPolicy()
-    for _ in range(30):
-        assert a.state() == b.state()
-        assert p.choose(a) == p.choose(b)
-        c = a.clone()
-        action = p.choose(a)
-        a.step(action)
-        b.step(action)
-        c.step(action)
-        assert a.state() == c.state()
-    full = Game(board=((2, 4, 2, 4), (4, 2, 4, 2), (2, 4, 2, 4), (4, 2, 4, 2)))
-    before = full.clone()
-    assert full.terminal and full.legal_actions == []
-    assert not full.step("LEFT")
-    assert (
-        full.state() == before.state() and full.rng.getstate() == before.rng.getstate()
+def test_candidates_are_well_formed():
+    state = State.initial(ROW)
+    candidates = state.candidates()
+    keys = [candidate["key"] for candidate in candidates]
+    assert len(keys) == len(set(keys))
+    combines = [candidate for candidate in candidates if candidate["kind"] == "COMBINE"]
+    stops = [candidate for candidate in candidates if candidate["kind"] == "STOP"]
+    assert len(stops) == len(state.quantities)
+    for candidate in combines:
+        assert candidate["i"] != candidate["j"]
+        if candidate["op"] in ("ADD", "MUL"):
+            assert candidate["i"] < candidate["j"]
+        assert candidate["value"] == apply_op(
+            candidate["op"],
+            state.quantities[candidate["i"]][0],
+            state.quantities[candidate["j"]][0],
+        )
+        assert state.describe(candidate).endswith(str(candidate["value"]))
+
+
+def test_combine_shrinks_the_pool_and_records_steps():
+    state = State.initial(ROW)
+    combine = next(
+        candidate
+        for candidate in state.candidates()
+        if candidate["kind"] == "COMBINE" and candidate["op"] == "ADD"
     )
+    advanced = state.combine(combine)
+    assert len(advanced.quantities) == len(state.quantities) - 1
+    assert advanced.quantities[-1][0] == combine["value"]
+    assert advanced.depth == 1 and len(advanced.steps) == 1
+    assert advanced.steps[0]["result"] == str(combine["value"])
+    with pytest.raises(CandidateError):
+        state.combine(next(c for c in state.candidates() if c["kind"] == "STOP"))
 
 
-def test_spawn():
-    g = Game(board=((2, 0, 0, 0),) * 4)
-    assert g.step("RIGHT") and g.steps == 1
-    assert sum(x > 0 for r in g.board for x in r) == 5
+def test_scripted_solution_reaches_the_gold_answer():
+    """The environment can produce a correct episode, so Y=1 is reachable."""
+    state = State.initial(ROW)
+    add = next(
+        candidate
+        for candidate in state.candidates()
+        if candidate["key"] == "COMBINE:ADD:0:1"
+    )
+    state = state.combine(add)
+    subtract = next(
+        candidate
+        for candidate in state.candidates()
+        if candidate["kind"] == "COMBINE"
+        and candidate["op"] == "SUB"
+        and candidate["value"] == ROW["gold"]
+    )
+    state = state.combine(subtract)
+    assert len(state.quantities) == 1
+    assert forced_stop_value(state) == ROW["gold"]
+    assert state.is_correct(forced_stop_value(state))
 
 
-def test_legal_actions_and_score():
-    g = Game(board=((2, 2, 0, 0), (0, 0, 0, 0), (0, 0, 0, 0), (0, 0, 0, 0)), score=12)
-    assert g.legal_actions == ["LEFT", "RIGHT", "DOWN"]
-    assert g.step("LEFT") and g.score == 16 and g.max_tile == 4
-    clone = g.clone()
-    clone.step(clone.legal_actions[0])
-    assert clone.steps == g.steps + 1
+def test_pool_collapse_forces_a_deterministic_answer():
+    state = State.initial(ROW)
+    while len(state.quantities) > 1:
+        state = state.combine(state.candidates()[0])
+    assert forced_stop_value(state) == state.quantities[0][0]
+    assert len(state.candidates()) == 1 and state.candidates()[0]["kind"] == "STOP"
 
 
-def test_spawn_distribution():
-    counts = Counter()
-    cells = Counter()
-    for seed in range(5000):
-        g = Game(seed, board=((0,) * 4,) * 4)
-        g.spawn()
-        counts[g.max_tile] += 1
-        cells.update((i, j) for i in range(4) for j in range(4) if g.board[i][j])
-    assert 0.08 < counts[4] / 5000 < 0.12
-    assert all(240 < n < 390 for n in cells.values())
+def test_gsm8k_parsing():
+    assert final_answer("steps...\n#### 1,234") == Fraction(1234)
+    assert final_answer("#### 2.5") == Fraction(5, 2)
+    with pytest.raises(ValueError):
+        final_answer("no marker here")
+    assert question_numbers("Tom has 3 cats and 12.5 dollars, twice 4") == (
+        (Fraction(3), "q1"),
+        (Fraction(25, 2), "q2"),
+        (Fraction(4), "q3"),
+    )

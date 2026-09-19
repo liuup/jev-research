@@ -1,75 +1,78 @@
-中文 | [English](README_en.md)
+# Jev-style decision model for GSM8K reasoning steps
 
-# Offline Jev / RLCD for 2048
+每一步不是生成整条思维链：模型在一个**结构化候选操作**集合上打分，输出
+`P(最终答案正确 | s_t, a_t, pi)`。计算器执行具体运算，环境推进到下一个 reasoning state。
 
-## 新输入协议：只以达到 2048 为目标
+## 任务定义
 
-`task=reach_2048`：STATE 是尚未成功的棋盘；ACTION 是一个合法首动作；QUESTION 是执行该动作后按指定冻结策略继续，能否在无合法动作前达到 2048；OPTIONS 为 `YES/NO`（内部 ID：`yes/no`）。成功后立即结束。
+- 初始题目池：GSM8K train prompts（官方 test 只用于最终评估）。
+- reasoning state：当前已知量集合（题目中的数字 + 已经算出的中间量）与已执行步骤。
+- 候选动作：`COMBINE:<op>:<i>:<j>`，`op ∈ {ADD, SUB, MUL, DIV}`；`ADD/MUL` 每个无序对一次，
+  `SUB/DIV` 每个有序对一次，因此两种操作数顺序都可达；另有 `STOP:<i>` 表示把某个量作为最终答案。
+  合并会消耗两个操作数并追加结果，所以从 `n` 个数字开始的 episode 最多 `n-1` 次合并。
+  除零候选在构造阶段就被排除，所有值用 `Fraction` 精确计算。
+- 事件：把最终答案与 GSM8K 的 `#### N` 比较，正确记 `Y=1`。
+- episode 结束条件：模型选择 `STOP`、池子塌缩到只剩一个量、或达到 `max_steps`（此时按确定性规则
+  取最后一个量）。
 
-`serialization.action_questions(game, continuation_policy_id)` 同时构建所有合法方向的问题，`controller.analyze_reach_2048(...)` 在一次批量前向中返回 `{动作: {yes: 概率, no: 概率}}`。四个合法动作对应八条候选路径；每个动作独立归一化。选择 `yes` 概率最大的合法动作，不在动作之间做 softmax。
+## 模型
 
-二分类数据转换、训练指标、MC 评估与整局成功即停止的控制流程已接通。历史七分类 checkpoint 仅供历史实验使用；新实验从共同的未训练初始化开始。向量 Brier 是二分类标量 Brier 的两倍。训练日志不再记录 log-tile 指标。
+`/root/shang/hf-modles/Qwen3.5-0.8B-Base` 的文本骨干，不使用自回归 LM head；新增 Jev 风格的
+candidate scoring head（set attention + 掩码归一化），对每个 `(state, action)` 输出 yes/no 两路
+概率。策略对动作的分布由各动作的 `P(yes)` 归一化得到（`rollout.action_distribution`）。
 
-```bash
-# 已生成的 success_pi0_v1 / success_smoke_v1 不可覆盖
-uv run python scripts/convert_success_data.py --output data/success_pi0_v1
-uv run python scripts/audit_data.py --data-dir data/success_pi0_v1
-sbatch slurm/success_smoke.sbatch
-# GPU 评估和游戏必须放在 Slurm 分配内，使用以下入口
-# uv run python scripts/evaluate.py --run runs/success_paired_pg_smoke_seed17
-# uv run python scripts/play.py --run runs/success_paired_pg_smoke_seed17 --games 10
-# 闭环对局默认一次玩一局；--batch-games 让多局共享一次前向，吞吐显著提高
-# uv run python scripts/play.py --run runs/success_paired_pg_seed17 --games 100 --seed 0 --batch-games 50
-# --controller hybrid 让启发式负责规划，模型只在启发式价值接近的候选里裁决；
-# --judge-delta 是允许放弃的启发式价值，取 0 时模型只在启发式完全平手时发言
-# uv run python scripts/play.py --run runs/success_paired_pg_seed17 --games 100 --seed 0 --batch-games 50 --controller hybrid --judge-delta 0.1
+## 训练
+
+每一代先冻结当前 policy，用它在线产生 trajectory（每题 `rollouts_per_problem` 次，
+最多 `max_steps` 步），记录的 `(s_t, a_t)` 用该 trajectory 的最终结果作为观测事件，
+再用 `paired_pg` / `ce` / `brier` 之一训练若干 optimizer steps，得到下一代 policy。
+冻结策略按 generation 切换，避免 calibration target 每步漂移。
+
+目标函数（`objectives.py`）：NanoJev 风格 proper-reward PG，`M=reward_samples` 次抽样，
+
+```text
+R    = (2/M) sum_i 1[A_i=Y] - sum_k c[k](c[k]-1)/(M(M-1)),   E[R] = 2 p.q - ||p||^2
+b_i  = (2/M) p[Y] - 2 sum_{j!=i} p[A_j]/(M(M-1))
+L_PG = -sum_i stop_gradient(r_i - b_i) log p[A_i],           E[grad] = grad ||p-q||^2
 ```
 
-转换保留所有源游戏 split，每条标签仍来自一次环境反馈；MC 合并后的 YES/NO 分布只用于评估。以下章节保留原七分类实验的复现说明。
+`tests/test_objectives.py` 用 float64 枚举验证了这条梯度恒等式。CE 与 Brier 作为对照臂保留，
+用 `configs/ce.yaml`、`configs/brier.yaml` 在同样的数据与调度下运行。
 
-本项目使用本地 `/root/shang/hf-modles/Qwen3.5-0.8B-Base` 研究静态数据上的 Jev 风格结果预测。模型不是动作分类器：对每个合法动作分别预测
+## 数据划分
 
-`p(终局最大砖 | 当前棋盘, 首个动作, 冻结启发式 continuation π0)`。
+`data/gsm8k` 由 `scripts/fetch_gsm8k.py` 从官方 `grade-school-math` 仓库下载并记录 sha256。
+train 里 95% 左右的问题（数字个数不超过 `max_quantities`）进入池子，再按 `validation_fraction`
+切成 RL train 与 validation；官方 1,319 道 test 只在 `scripts/evaluate.py` 里使用，不参与任何 rollout。
 
-输出为 `<256, 256, 512, 1024, 2048, 4096, 8192+` 上的完整概率分布。模型不生成文本；Qwen 文本骨干提取每个候选的表示，共享 set-attention 决策头在候选间归一化。视觉塔冻结，文本骨干和决策头全参数训练。
-
-## 数据与防泄漏
-
-固定行为策略从独立种子游戏采集棋盘。每个棋盘的所有合法首动作都从同一状态分支，随后固定启发式 `π0` 玩到终局。每个 `(state, action)` 仅保存一次真实随机终局事件，不保存 MC 概率作为训练标签。
-
-`train/dev/calibration/test` 使用互不重叠的源游戏种子；同一源游戏和同一棋盘的所有动作不会跨 split。`manifest.json` 保存配置、策略/模拟器哈希、split 计数和文件哈希，`audit_data.py` 会再次验证隔离。MC reference 从 test 棋盘另行生成，只用于评估。
+## 运行
 
 ```bash
-uv sync --locked
+uv sync
 uv run pytest -q
-
-# 通过 Slurm 生成约 100k/2k/2k/4k questions 并自动审计
-sbatch slurm/generate_data.sbatch data/offline_pi0_v1
-# 数据完成后构建 evaluation-only MC reference
-sbatch slurm/build_mc_reference.sbatch data/offline_pi0_v1
+uv run python scripts/fetch_gsm8k.py      # CPU，需要网络
+sbatch slurm/smoke.sbatch                  # 一次极小 generation，确认链路
+sbatch slurm/train.sbatch runs/paired_pg configs/train.yaml
+sbatch slurm/train.sbatch runs/ce configs/ce.yaml
+sbatch slurm/train.sbatch runs/brier configs/brier.yaml
 ```
 
-启发式基准（100 局、seed 17）：mean score 15543.88，median 15084，达到 512/1024/2048 的概率为 0.96/0.72/0.18。训练数据生成后不得调整 `π0`。
+GPU 操作必须在 Slurm 分配内（`runtime.require_slurm`）。rollout 成本随
+`problems_per_generation × rollouts_per_problem × max_steps × 每个状态的候选数` 增长，
+候选数约为 `3m(m-1)+m`（`m` 为当前池子大小），先用 smoke 测出吞吐再放大。
+`uv run python scripts/train.py --test --output runs/paired_pg` 在 test 上做最终评估。
 
-## 训练目标
+## 评估
 
-- `ce`：观测结果的负对数似然。
-- `brier`：预测分布与观测 one-hot 的向量 Brier loss。
-- `paired_pg`：32 个预测结果标签抽样和 detached 条件 baseline 的 RLCD-inspired proper-reward PG。这里的抽样是结果标签，不是 2048 动作。
+每个 generation 结束时在固定 validation 问题上用贪心策略跑一遍，报告：
 
-三者使用完全相同的数据、batch schedule、seed、优化步数和 `runs/offline_common_init.pt`。主配置在 `configs/offline.yaml`，默认 500 steps、effective batch 256、microbatch 16。paired-PG 的环境反馈已经冻结在离线数据中；训练阶段不再 rollout。
+- `final_answer_accuracy`：整题最终答案正确的比例。
+- 概率质量：`observed_brier`（向量，等于标量二分类 Brier 的两倍）、`binary_brier`、`observed_nll`、
+  `mean_entropy`、`ece_ge_correct` 与可靠性图（预测 0.8 的 state-action 实际成功率是否接近 80%）。
+- `risk_coverage`：按置信度排序后的准确率曲线与 AURC。
+- `action_ranking`（`action_reference_problems > 0` 时）：把模型对各动作的 `P(yes)` 排名与
+  重复 rollout 得到的经验成功率排名比较，给出一致率与后悔值，这就是 step/action 层面的准确度。
 
-```bash
-# GPU 操作只能经 Slurm；先创建一次公共初始化
-sbatch slurm/initialize.sbatch
-
-# 单目标或三目标比较
-sbatch --job-name=jev-offline-pg-seed17 slurm/train.sbatch paired_pg
-bash slurm/submit_all.sh
-bash slurm/status.sh
-# bash slurm/cancel.sh JOB_ID [JOB_ID ...]
-```
-
-`training.jsonl` 记录 loss、梯度、reward/advantage、NLL、Brier、熵、top-1 和预测分布，不记录逐步耗时或显存。`training_stats.json` 单独保存总训练时间和峰值显存。测试报告在对应 `runs/offline_*_seed17/`；`scripts/summarize.py` 生成 `results/comparison.{json,csv,md}`。
-
-NLL/Brier/ECE 衡量概率质量，top-1 不是校准。MC 概率从不参与训练。闭环游戏成绩是单独的控制演示，不能直接视为 `π0` 条件下的校准结论。
+产物：`runs/<name>/generations.json`、`training.jsonl`、`generation_XXX/{trajectories,rows,
+validation_rows}.jsonl`、`generation_XXX/{rollout,validation}_metrics.json`、`checkpoint.pt`、
+`summary.json`。

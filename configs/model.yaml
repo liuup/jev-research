@@ -1,6 +1,6 @@
 base_model: /root/shang/hf-modles/Qwen3.5-0.8B-Base
 seed: 17
-max_length: 512
+max_length: 1024
 head_width: 256
 attention_heads: 4
 gradient_checkpointing: true

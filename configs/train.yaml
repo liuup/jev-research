@@ -1,0 +1,32 @@
+# Generation-wise online RLCD training on GSM8K train prompts.
+# Rollout cost grows with problems x rollouts x max_steps x candidates per state, so
+# scale these knobs only after checking the measured throughput in the smoke run.
+mode: online
+seed: 17
+data_dir: data/gsm8k
+objective: paired_pg
+baseline: conditional
+reward_samples: 32
+generations: 20
+problems_per_generation: 3000
+rollouts_per_problem: 4
+max_steps: 8
+max_quantities: 6
+steps_per_generation: 200
+effective_batch: 32
+microbatch: 8
+backbone_lr: 0.00002
+head_lr: 0.0002
+weight_decay: 0.01
+warmup_steps: 20
+eval_every: 50
+checkpoint_every: 1
+validation_fraction: 0.1
+split_seed: 27000000
+validation_problems: 128
+test_problems: 1319
+inference_questions: 16
+temperature: 1.0
+rollout_mode: sample
+action_reference_problems: 1
+action_reference_repeats: 2

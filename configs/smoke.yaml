@@ -1,0 +1,14 @@
+# One tiny generation that exercises collection, both objectives and evaluation.
+inherit: train.yaml
+generations: 1
+problems_per_generation: 4
+rollouts_per_problem: 2
+max_steps: 3
+steps_per_generation: 2
+effective_batch: 4
+microbatch: 2
+warmup_steps: 1
+validation_problems: 2
+inference_questions: 4
+max_length: 1024
+action_reference_problems: 0

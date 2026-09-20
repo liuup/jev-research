@@ -211,7 +211,20 @@ def main():
             curves["conditional"],
         )
     ]
-    print(json.dumps(dict(figures=[str(generation_path), str(step_path)], rows=rows), indent=2))
+    curves_path = Path(args.out_dir) / f"{name}_curves.json"
+    curves_path.write_text(
+        json.dumps(
+            dict(run=args.run, generations=len(generations), steps=len(steps), curves=rows),
+            indent=2,
+        )
+        + "\n"
+    )
+    print(
+        json.dumps(
+            dict(figures=[str(generation_path), str(step_path)], data=str(curves_path), rows=rows),
+            indent=2,
+        )
+    )
 
 
 if __name__ == "__main__":

@@ -58,51 +58,50 @@ def generation_figure(run, generations, out_path):
     controller = series(generations, "dev_controller", "solved_rate")
     first_ok = series(generations, "dev_controller", "first_action_solvable_rate")
     conditional = np.divide(controller, first_ok, out=np.zeros_like(controller), where=first_ok > 0)
-    ax.set_yscale("log")
-    ax.plot(gen, controller, "o-", color="tab:blue", label="greedy controller solves")
-    ax.plot(gen, first_ok, "s--", color="tab:cyan", label="first action keeps solvable")
-    ax.plot(gen, conditional, "d-.", color="tab:green", label="solves | first action ok")
+    ax.plot(gen, controller, "-", color="tab:blue", label="greedy controller solves")
+    ax.plot(gen, first_ok, "--", color="tab:cyan", label="first action keeps solvable")
+    ax.plot(gen, conditional, "-.", color="tab:green", label="solves | first action ok")
     ax.axhline(RANDOM_PLAY, color="gray", ls=":", label=f"random play {RANDOM_PLAY:.4f}")
     ax.axhline(RANDOM_FIRST_SOLVABLE, color="gray", ls="-.", label=f"chance first step {RANDOM_FIRST_SOLVABLE:.3f}")
     ax.axhline(RANDOM_CONDITIONAL / RANDOM_FIRST_SOLVABLE, color="gray", ls="--", label="random | first action ok")
-    ax.set(title="Controller on the 204 dev puzzles", xlabel="generation", ylabel="rate (log scale)")
-    ax.grid(alpha=0.3, which="both")
-    ax.legend(fontsize=8, loc="lower right")
+    ax.set(title="Controller on the 204 dev puzzles", xlabel="generation", ylabel="rate")
+    ax.grid(alpha=0.3)
+    ax.legend(fontsize=8, loc="upper left")
 
     ax = axes[0, 1]
-    ax.plot(gen, series(generations, "rollout", "solved_rate"), "o-", label="collection event rate")
-    ax.plot(gen, series(generations, "frozen_dev_rollout", "solved_rate"), "s-", label="frozen policy on dev")
-    ax.plot(gen, series(generations, "rollout", "mean_p_yes"), "^:", label="model prediction (collection)")
-    ax.plot(gen, series(generations, "dev_calibration", "predicted_success_probability"), "v:", label="model prediction (dev)")
+    ax.plot(gen, series(generations, "rollout", "solved_rate"), "-", color="tab:blue", label="collection event rate")
+    ax.plot(gen, series(generations, "frozen_dev_rollout", "solved_rate"), "--", color="tab:orange", label="frozen policy on dev")
+    ax.plot(gen, series(generations, "rollout", "mean_p_yes"), ":", color="tab:green", label="model prediction (collection)")
+    ax.plot(gen, series(generations, "dev_calibration", "predicted_success_probability"), "-.", color="tab:red", label="model prediction (dev)")
     ax.set(title="Frozen-policy success event", xlabel="generation", ylabel="rate")
     ax.grid(alpha=0.3)
     ax.legend(fontsize=8)
 
     ax = axes[0, 2]
     rate = series(generations, "dev_calibration", "yes_rate")
-    ax.plot(gen, series(generations, "dev_calibration", "observed_nll"), "o-", label="NLL")
-    ax.plot(gen, series(generations, "dev_calibration", "binary_brier"), "s-", label="binary Brier")
-    ax.plot(gen, series(generations, "dev_calibration", "ece_ge_correct"), "^-", label="ECE")
-    ax.plot(gen, rate * (1 - rate), "k--", label="constant-predictor Brier")
+    ax.plot(gen, series(generations, "dev_calibration", "observed_nll"), "-", color="tab:blue", label="NLL")
+    ax.plot(gen, series(generations, "dev_calibration", "binary_brier"), "--", color="tab:orange", label="binary Brier")
+    ax.plot(gen, series(generations, "dev_calibration", "ece_ge_correct"), "-.", color="tab:green", label="ECE")
+    ax.plot(gen, rate * (1 - rate), ":", color="black", label="constant-predictor Brier")
     ax.set(title="Dev calibration (moves with the event rate)", xlabel="generation", ylabel="value")
     ax.grid(alpha=0.3)
     ax.legend(fontsize=8)
 
     ax = axes[1, 0]
-    ax.plot(gen, series(generations, "mean_gradient_norm"), "o-", color="tab:blue", label="gradient norm")
+    ax.plot(gen, series(generations, "mean_gradient_norm"), "-", color="tab:blue", label="gradient norm")
     ax.set(title="Paired-PG signal per generation", xlabel="generation", ylabel="gradient norm")
     ax.grid(alpha=0.3)
     ax2 = ax.twinx()
-    ax2.plot(gen, series(generations, "rollout", "mean_action_entropy"), "s--", color="tab:orange", label="action entropy")
+    ax2.plot(gen, series(generations, "rollout", "mean_action_entropy"), "--", color="tab:orange", label="action entropy")
     ax2.set_ylabel("action entropy")
     lines = ax.get_lines() + ax2.get_lines()
     ax.legend(lines, [line.get_label() for line in lines], fontsize=8)
 
     ax = axes[1, 1]
-    ax.plot(gen, series(generations, "rollout", "row_yes_rate"), "o-", label="observed event rate (train)")
-    ax.plot(gen, series(generations, "rollout", "mean_p_yes"), "s--", label="prediction (train)")
-    ax.plot(gen, series(generations, "dev_calibration", "yes_rate"), "^-", label="observed (dev)")
-    ax.plot(gen, series(generations, "dev_calibration", "predicted_success_probability"), "v--", label="prediction (dev)")
+    ax.plot(gen, series(generations, "rollout", "row_yes_rate"), "-", color="tab:blue", label="observed event rate (train)")
+    ax.plot(gen, series(generations, "rollout", "mean_p_yes"), "--", color="tab:orange", label="prediction (train)")
+    ax.plot(gen, series(generations, "dev_calibration", "yes_rate"), "-.", color="tab:green", label="observed (dev)")
+    ax.plot(gen, series(generations, "dev_calibration", "predicted_success_probability"), ":", color="tab:red", label="prediction (dev)")
     ax.set(title="Calibration tracking", xlabel="generation", ylabel="rate")
     ax.grid(alpha=0.3)
     ax.legend(fontsize=8)
@@ -114,18 +113,8 @@ def generation_figure(run, generations, out_path):
     ax.grid(alpha=0.3)
     ax.legend(fontsize=8)
 
-    axes[0, 0].annotate(
-        "generation 0 continued with the solver-mixed pi0",
-        xy=(0, controller[0]),
-        xytext=(0.18, 0.06),
-        textcoords="axes fraction",
-        fontsize=8,
-        color="red",
-        arrowprops=dict(arrowstyle="->", color="red", lw=0.8),
-    )
-    figure.suptitle(f"{run}: generation curves", fontsize=14)
-    figure.tight_layout(rect=(0, 0, 1, 0.96))
-    figure.savefig(out_path, dpi=130)
+    figure.tight_layout()
+    figure.savefig(out_path, dpi=200)
     return dict(gen=gen, controller=controller, first_ok=first_ok, conditional=conditional)
 
 
@@ -171,9 +160,8 @@ def step_figure(run, steps, out_path):
             axis.axvline(boundary, color="gray", alpha=0.4, lw=0.8)
         for axis in (axes[1, 1], axes[1, 2]):
             axis.axvline(boundary, color="gray", alpha=0.4, lw=0.8)
-    figure.suptitle(f"{run}: step-level training diagnostics ({len(steps)} steps)", fontsize=14)
-    figure.tight_layout(rect=(0, 0, 1, 0.96))
-    figure.savefig(out_path, dpi=130)
+    figure.tight_layout()
+    figure.savefig(out_path, dpi=200)
 
 
 def main():

@@ -62,26 +62,37 @@ data/24game/
 中间结果允许负数与分数，全程 `Fraction`，不做任何浮点近似。`solvable_after`（执行后是否
 仍可解）只用于测试与 oracle 评估，不作为 RLCD 的概率标签。
 
-## 3. 模型输入
+## 3. 模型输入与输出
 
-一个 `(状态, 动作)` 对应两条候选路径，prompt 形如：
+当前实验是 **24 点**，它对当前状态的每个合法动作分别回答：执行该动作、随后由冻结策略继续，最终是否会得到 24？
+
+下面是一个完整例子。题目从 `[3, 3, 8, 8]` 开始，已经执行：
+
+```text
+1. 8 / 3 = 8/3
+2. 3 - 8/3 = 1/3
+```
+
+当前只剩 `[1/3, 8]`，还需要一次运算。对于动作 `8 / 1/3 = 24`，会构造两条输入路径。
+两条路径内容完全相同，只有最后的候选标签不同：
 
 ```text
 [STATE]
 Target: 24
-Remaining: 8/3 3 8
+Remaining: 1/3 8
 
 Steps already taken:
 1. 8 / 3 = 8/3
+2. 3 - 8/3 = 1/3
 
 [CONTINUATION]
 Use the frozen continuation policy.
 
 [ACTION]
-3 - 8/3 = 1/3
+8 / 1/3 = 24
 
 [QUESTION]
-If this action is performed now and the frozen policy continues, will the final value equal 24 after 2 more operations?
+If this action is performed now and the frozen policy continues, will the final value equal 24 after 1 more operation?
 
 [OPTIONS]
 YES
@@ -91,9 +102,49 @@ NO
 YES
 ```
 
-模型对每个动作输出 `P(YES)`，控制器取最大者（控制评估）或按归一化后的 `P(YES)` 采样
-（采集）。具体 `policy_id` 只保存在数据和日志元数据中，不写入 prompt，避免每一代出现从未训练过的
-任意 ID token。
+第二条路径的最后两行是：
+
+```text
+[CANDIDATE]
+NO
+```
+
+Qwen 文本 backbone 一次处理两条路径，分别取最后一个非 padding token 的隐藏状态；共享决策头在
+`YES/NO` 候选集合上做 attention 和 softmax。示意输出为：
+
+```json
+{"action": "8 / 1/3 = 24", "probabilities": {"yes": 0.97, "no": 0.03}}
+```
+
+控制器实际会把当前状态的**所有合法动作一次批量送入模型**。这个状态有 6 个动作，即 6 个问题、
+每题 2 条候选路径，共 12 条 backbone 输入。内部批结构和一组示意输出如下：
+
+```json
+{
+  "question_offsets": [0, 2, 4, 6, 8, 10, 12],
+  "candidate_ids": ["yes", "no"],
+  "action_keys": ["+:1/3:8", "*:1/3:8", "-:1/3:8", "-:8:1/3", "/:1/3:8", "/:8:1/3"],
+  "probabilities": [
+    {"action": "1/3 + 8 = 25/3",  "yes": 0.01,  "no": 0.99},
+    {"action": "1/3 * 8 = 8/3",   "yes": 0.02,  "no": 0.98},
+    {"action": "1/3 - 8 = -23/3", "yes": 0.01,  "no": 0.99},
+    {"action": "8 - 1/3 = 23/3",  "yes": 0.02,  "no": 0.98},
+    {"action": "1/3 / 8 = 1/24",  "yes": 0.001, "no": 0.999},
+    {"action": "8 / 1/3 = 24",    "yes": 0.97,  "no": 0.03}
+  ]
+}
+```
+
+以上数值仅用于解释接口。每个动作内部都有 `P(YES)+P(NO)=1`，但不同动作的 `P(YES)` **不需要**
+加和为 1，因为它们是六个独立的终局事件问题，而不是 `P(选择某个动作)`。
+
+- greedy 评估选择 `P(YES)` 最大的 `8 / 1/3 = 24`；执行后精确结果为 24，终局标签为 `YES`；
+- rollout 数据采集将各动作的 `P(YES)` 归一化成探索分布，再随机选择一个动作；
+- 对更早的状态，第一步之后仍有多个动作，最终 `YES/NO` 由整条冻结策略 rollout 的真实结果决定；
+- `observed_outcome` 只作为训练目标保存，绝不拼进模型输入。
+
+具体 `policy_id` 也只保存在数据和日志元数据中，不写入 prompt，避免每一代出现从未训练过的任意
+ID token。
 
 ## 4. 在线 RLCD 循环
 
@@ -113,36 +164,7 @@ YES
 动作里等概率选一个），否则交给模型。第 1 代起完全由模型自己续玩。求解器只在第 0 代以这个
 方式参与数据生成，之后不再出现。
 
-## 5. 实测性能与超参数
-
-`uv run python scripts/benchmark_batches.py`（Slurm 作业，结果 `results/benchmark_batches.json`）
-在 RTX 5090 上测于真实牌局状态（第一步动作数 10–22）：
-
-| 形状 | 设置 | 峰值显存 | 吞吐 |
-| --- | --- | --- | --- |
-| 候选打分前向 bf16 | 16 / 64 / 512 题每次 | 3.9 / 4.7 / 11.8 GiB | 499 / 513 / 504 题/s |
-| 候选打分前向 fp32 | 16 / 64 / 512 题每次 | 3.3 / 4.7 / 17.4 GiB | 195 / 213 / 209 题/s |
-| 完整状态打分（真实收集路径） | 4 / 24 状态 | 3.94 GiB | 27.4 / 22.2 状态/s |
-| 训练步 | microbatch 4 / 32 / 128 | 14.0 GiB | 42 / 110 / 116 行/s |
-
-结论：
-
-- **bf16 比 fp32 快 2.4 倍**，显存相同，因此 `inference_precision: bf16` 成为默认；
-- 前向吞吐从 16 题起就进入平台（499→504 题/s），题数只影响显存，`inference_questions: 32`
-  在平台上同时减少调用次数；
-- 当前实现保持 Qwen backbone 为 BF16、决策头为 FP32；旧的 FP32-master 训练显存数字不再作为
-  正式依据，提交主实验前应重新运行 benchmark。
-
-按上表，正式配置（`configs/train.yaml`）与预算：
-
-| 阶段 | 量 | 耗时 |
-| --- | --- | --- |
-| 收集 | 954 题 × 4 次 rollout × 3 步 = 11,448 个状态 ≈ 23 万个候选问题 | 约 9 分钟 |
-| 训练 | 300 步 × 64 行 = 19,200 次行前向 | 约 3 分钟 |
-| frozen dev 采集 + greedy controller + checkpoint | 204 题 × 4 次 sampled，另加 204 题 greedy | 需以新 smoke 实测 |
-| **每代合计** | | **修复后重新测量** |
-
-## 6. 运行
+## 5. 运行
 
 ```bash
 uv run pytest -q                                   # 49 个 CPU 测试
@@ -159,7 +181,7 @@ uv run python scripts/evaluate.py --run runs/paired_pg   # 单独跑 test 评估
 
 所有 GPU 工作必须在 Slurm 分配内运行（`runtime.require_slurm`）。
 
-## 7. 产物与指标
+## 6. 产物与指标
 
 ```text
 runs/<name>/
@@ -186,7 +208,32 @@ runs/<name>/
   是否有效；
 - `aurc` / risk-coverage：按置信度排序后的准确率曲线。
 
-## 8. 已知限制
+### 训练曲线
+
+![按 generation 汇总的训练与评测曲线](figs/paired_pg_24game_seed17_generations.png)
+
+上图按 generation 汇总在线训练结果。左上角显示 greedy controller 在 204 道固定 dev 题上的
+成功率、第一步保持可解的比例，以及第一步正确后的条件成功率；中上图比较训练采集策略与冻结
+策略在 dev 上的真实成功事件率；右上图给出 NLL、binary Brier 和 ECE，三者都是越低越好。
+后期 controller 成功率明显提升，但 train 与 dev 的事件率逐渐分离，同时校准误差上升，说明模型
+学会了更有效的动作排序，也出现了过拟合和过度自信。
+
+![逐 optimizer step 的训练诊断曲线](figs/paired_pg_24game_seed17_steps.png)
+
+上图按 optimizer step 展示 paired-PG 的优化信号。原始浅色线是单步统计，红线是 30-step
+滑动平均；`gradient norm` 和 `advantage |mean|` 用于观察更新强度，`collision rate` 上升表示
+预测采样越来越集中，右下角的熵下降也反映了策略逐渐确定。`loss` 本身不是成功率，是否真正
+变强应以 generation 图中的独立 dev controller 成功率为主，并同时检查校准指标。
+
+重新生成两张图：
+
+```bash
+uv run python scripts/plot_training.py \
+  --run runs/paired_pg_24game_seed17 \
+  --out-dir figs
+```
+
+## 7. 已知限制
 
 - 458 道不可解题在动作空间内确实无解，模型对它们唯一正确的行为是让 `P(YES)` 保持低位，
   因此它们只用于稳健性检查，不计入成功率。
